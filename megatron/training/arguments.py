@@ -30,6 +30,7 @@ from megatron.core.utils import (
     is_torch_min_version,
 )
 from megatron.core.activations import squared_relu, rlglu_act, sssglu_act, lglu_act, situ_act
+from megatron.core.exp_gates import GATES as EXP_GATES
 from megatron.core.fusions.fused_bias_geglu import quick_gelu
 from megatron.core.fusions.fused_bias_ssglu import sslu
 from megatron.training.utils import (
@@ -1939,6 +1940,18 @@ def core_transformer_config_from_args(args, config_class=None):
         kw_args['gated_linear_unit'] = True
         kw_args['activation_func'] = situ_act
         kw_args['bias_activation_fusion'] = False
+    elif getattr(args, 'exp_gate', None) is not None:
+        # Activation-sweep gates (megatron/core/exp_gates.py). --exp-gate NAME picks any of the
+        # builder gates (exp_l{L}m{M}r{R}_p{power}_b{shift}) or exp_arglu / baselines. Non-learnable
+        # elementwise gate -> generic (non-fused) GLU path, exactly like --lglu / --situ.
+        assert not args.swiglu
+        fn = EXP_GATES[args.exp_gate]
+        assert not isinstance(fn, type), (
+            f"--exp-gate {args.exp_gate} is a learnable gate; not yet wired for MoE per-expert "
+            f"params. Use a fixed builder gate (exp_l..._p..._b0) instead.")
+        kw_args['gated_linear_unit'] = True
+        kw_args['activation_func'] = fn
+        kw_args['bias_activation_fusion'] = False
     if args.pnglu:
         # PolyNorm GLU replaces the gate of a gated linear unit; it is itself a (learnable)
         # gated unit, so it cannot be combined with the non-gated squared-relu.
@@ -2469,6 +2482,10 @@ def _add_network_size_args(parser):
                        help='Use SiTU: gate f(x)=sigmoid(x)*tanh(x), output f(x_glu)*x_linear. '
                        'Non-learnable; implies gated linear units. No fused kernel (runs through '
                        'the generic GLU path).')
+    group.add_argument('--exp-gate', type=str, default=None,
+                       help='Activation-sweep gate by name from megatron/core/exp_gates.py, e.g. '
+                       'exp_l0m1r0_p0.5_b1 (rsqrt bump) or exp_arglu. Non-learnable; implies gated '
+                       'linear units, runs through the generic GLU path (like --lglu / --situ).')
     group.add_argument('--pnglu', action='store_true',
                        help='Replace the SiLU gate of SwiGLU with a learnable 2nd-order '
                        'PolyNorm: gate(x) = |a1|*RMSNorm(x) + |a2|*RMSNorm(x**2). '
