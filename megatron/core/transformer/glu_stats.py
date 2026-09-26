@@ -29,6 +29,10 @@ For a GLU  h = z1 * f(z2)  (z2 = gate input, f = the gate, h = input of fc2):
 Sites: "routed" (MoE experts), "shared" (shared expert), "dense" (dense MLP
 layers), "resid" (transformer-layer output), "logits" (first 64 positions of the
 LM head output) and "router" (tokens per expert: CV, max/mean, dead experts).
+
+Tags: layer averages under gate-quant/, gate-outliers/, gate-deadzone/, gate-moments/,
+residual/, logits/, router/ (e.g. gate-quant/routed/h_mxfp4_flush); a curated subset
+per layer under layers-<section>/.../L<nn>.
 """
 import math
 
@@ -358,9 +362,34 @@ def _metrics(S, M, V):
 
 _MAX_LIKE = ("absmax", "crest", "_max")
 
+# Tag layout: TensorBoard and wandb both group by the first path segment, so each
+# topic gets its own small section. Layer averages go to <topic>/..., and a curated
+# subset of metrics is also logged per layer to layers-<topic>/.../L<nn>.
+_SITE_SECTION = {"resid": "residual", "logits": "logits", "router": "router"}
+_PER_LAYER = {
+    "h/rms", "h/crest", "h/kurtosis", "h/mxfp4_flush", "h/nvfp4_flush", "dz2/rms",
+    "dz2/mxfp4_flush", "deadzone_fp4", "dead_units_fp4", "h/outlier_channel_ratio",
+    "x/rms", "x/absmax", "load_cv", "dead_experts",
+}
+
+
+def _tag(site, metric):
+    """(site, metric) -> (section, leaf)."""
+    if site in _SITE_SECTION:
+        return _SITE_SECTION[site], metric.replace("x/", "")
+    if metric.endswith(("_flush", "_relerr")):
+        section = "gate-quant"
+    elif metric.startswith(("deadzone", "dead_units")):
+        section = "gate-deadzone"
+    elif metric.endswith(("crest", "kurtosis")) or "outlier_channel" in metric:
+        section = "gate-outliers"
+    else:
+        section = "gate-moments"
+    return section, f"{site}/{metric.replace('/', '_')}"
+
 
 def reduce_and_log(iteration, writer=None, wandb_writer=None):
-    """All ranks must call this on the same iterations. Writes per-layer + layer-aggregate tags."""
+    """All ranks must call this on the same iterations. Writes layer-average + per-layer tags."""
     if not _T.active:
         return
     _T.active = False
@@ -368,13 +397,16 @@ def reduce_and_log(iteration, writer=None, wandb_writer=None):
     metrics = _metrics(S, M, V)
     scalars = {}
     for (site, metric), per_slot in metrics.items():
-        for slot, val in per_slot.items():
-            if slot > 0:
-                scalars[f"glu/{site}/{metric}/layer_{slot:02d}"] = val
+        section, leaf = _tag(site, metric)
+        # dense MLPs and the LM head occupy a single slot: their average is already per-layer
+        if metric in _PER_LAYER and site not in ("dense", "logits"):
+            for slot, val in per_slot.items():
+                if slot > 0:
+                    scalars[f"layers-{section}/{leaf}/L{slot:02d}"] = val
         vals = list(per_slot.values())
         agg = max(vals) if any(metric.endswith(s) or s in metric for s in _MAX_LIKE) \
             else sum(vals) / len(vals)
-        scalars[f"glu/{site}/{metric}"] = agg
+        scalars[f"{section}/{leaf}"] = agg
     if writer is not None:
         for tag, val in scalars.items():
             writer.add_scalar(tag, val, iteration)
@@ -386,13 +418,13 @@ def reduce_and_log(iteration, writer=None, wandb_writer=None):
             v = scalars.get(k)
             return "n/a" if v is None else f"{v:.4g}"
         print(f"[glu-stats] iter {iteration} | {len(scalars)} scalars | routed h: rms "
-              f"{g('glu/routed/h/rms')} crest {g('glu/routed/h/crest')} kurt "
-              f"{g('glu/routed/h/kurtosis')} fp8/mxfp4/nvfp4 flush "
-              f"{g('glu/routed/h/fp8_flush')}/{g('glu/routed/h/mxfp4_flush')}/"
-              f"{g('glu/routed/h/nvfp4_flush')} | routed dz2 mxfp4 flush "
-              f"{g('glu/routed/dz2/mxfp4_flush')} | dead units fp4 routed/shared/dense "
-              f"{g('glu/routed/dead_units_fp4')}/{g('glu/shared/dead_units_fp4')}/"
-              f"{g('glu/dense/dead_units_fp4')} | resid rms {g('glu/resid/x/rms')} | logits "
-              f"absmax {g('glu/logits/x/absmax')} | router cv {g('glu/router/load_cv')}",
+              f"{g('gate-moments/routed/h_rms')} crest {g('gate-outliers/routed/h_crest')} kurt "
+              f"{g('gate-outliers/routed/h_kurtosis')} fp8/mxfp4/nvfp4 flush "
+              f"{g('gate-quant/routed/h_fp8_flush')}/{g('gate-quant/routed/h_mxfp4_flush')}/"
+              f"{g('gate-quant/routed/h_nvfp4_flush')} | routed dz2 mxfp4 flush "
+              f"{g('gate-quant/routed/dz2_mxfp4_flush')} | dead units fp4 routed/shared/dense "
+              f"{g('gate-deadzone/routed/dead_units_fp4')}/{g('gate-deadzone/shared/dead_units_fp4')}/"
+              f"{g('gate-deadzone/dense/dead_units_fp4')} | resid rms {g('residual/rms')} | logits "
+              f"absmax {g('logits/absmax')} | router cv {g('router/load_cv')}",
               flush=True)
     return scalars

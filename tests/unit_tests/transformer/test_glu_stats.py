@@ -114,22 +114,22 @@ def test_tracker_end_to_end():
     # dead zone (fp4 floor 1/12): |f'| < 1/12  <=>  |x| > 11; unit 0 is always dead.
     p = 2 * (1 - 0.5 * (1 + math.erf(11 / sigma / math.sqrt(2))))
     expect = (1 / F) * 1.0 + (1 - 1 / F) * p
-    got = sc["glu/routed/deadzone_fp4/layer_01"]
+    got = sc["layers-gate-deadzone/routed/deadzone_fp4/L01"]
     print(f"  dead zone fp4: got {got:.4f} expected {expect:.4f}")
     assert abs(got - expect) < 0.01, (got, expect)
-    du = sc["glu/routed/dead_units_fp4/layer_01"]
+    du = sc["layers-gate-deadzone/routed/dead_units_fp4/L01"]
     print(f"  dead units fp4: got {du:.4f} expected {1/F:.4f} (one unit per expert)")
     assert abs(du - 1 / F) < 1e-6, du
     # moments of h against a direct computation
     rms = h_planted.float().pow(2).mean().sqrt().item()
-    assert abs(sc["glu/routed/h/rms/layer_01"] - rms) / rms < 1e-4
-    assert "glu/routed/dz2/mxfp4_flush" in sc and "glu/routed/dz1/rms" in sc
+    assert abs(sc["layers-gate-moments/routed/h_rms/L01"] - rms) / rms < 1e-4
+    assert "gate-quant/routed/dz2_mxfp4_flush" in sc and "gate-moments/routed/dz1_rms" in sc
     # router: 8/16 experts idle -> dead 0.5, loads {rows, 0} -> cv 1, max/mean 2
-    assert abs(sc["glu/router/dead_experts/layer_01"] - 0.5) < 1e-9
-    assert abs(sc["glu/router/load_cv/layer_01"] - 1.0) < 1e-9
-    assert abs(sc["glu/router/load_max_over_mean/layer_01"] - 2.0) < 1e-9
-    assert abs(sc["glu/resid/x/rms/layer_02"] - 3.0) < 0.3
-    assert "glu/logits/x/absmax" in sc
+    assert abs(sc["layers-router/dead_experts/L01"] - 0.5) < 1e-9
+    assert abs(sc["layers-router/load_cv/L01"] - 1.0) < 1e-9
+    assert abs(sc["router/load_max_over_mean"] - 2.0) < 1e-9
+    assert abs(sc["layers-residual/rms/L02"] - 3.0) < 0.3
+    assert "logits/absmax" in sc and not any(k.startswith("glu/") for k in sc)
     assert not gs.is_active()
 
 
@@ -146,7 +146,7 @@ def test_outlier_channel_ratio():
     h[:, 7] *= 100.0                                # one outlier channel
     gs.record_glu("dense", z1, z2, g, h, gate, None)
     sc = gs.reduce_and_log(iteration=1)
-    r = sc["glu/dense/h/outlier_channel_ratio/layer_01"]
+    r = sc["gate-outliers/dense/h_outlier_channel_ratio"]
     print(f"  outlier-channel ratio with a x100 channel: {r:.1f}")
     assert 60 < r < 160, r
 
