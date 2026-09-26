@@ -53,6 +53,7 @@ from functools import partial
 
 import torch.distributed
 
+from megatron.core.transformer import glu_stats
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.optimizer_param_scheduler import get_canonical_lr_for_logging
 from .log_handler import CustomHandler
@@ -3331,6 +3332,13 @@ def train(
             max_attention_logit = None
         else:
             ft_integration.on_training_step_start()
+            if args.log_glu_stats:
+                # Gate statistics for the iteration that ends at iteration + 1 (see glu_stats.py).
+                glu_stats.begin_step(
+                    (iteration + 1) % args.glu_stats_interval == 0,
+                    args.num_layers,
+                    args.num_experts,
+                )
             (
                 loss_dict,
                 skipped_iter,
@@ -3385,6 +3393,8 @@ def train(
                         cuda_graph_helper.cuda_graph_set_manual_hooks()
 
         iteration += 1
+        if args.log_glu_stats and glu_stats.is_active():
+            glu_stats.reduce_and_log(iteration, get_tensorboard_writer(), get_wandb_writer())
 
         # If requested, manually register FSDP communication buffers after a short warmup.
         if (

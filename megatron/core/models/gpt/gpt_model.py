@@ -4,6 +4,8 @@ from collections import OrderedDict
 from typing import Dict, Literal, Optional
 
 import torch
+
+from megatron.core.transformer import glu_stats
 from torch import Tensor
 
 from megatron.core import tensor_parallel
@@ -684,6 +686,8 @@ class GPTModel(LanguageModule):
 
         # Apply MuP output scaling to logits
         logits = self._scale_logits(logits)
+        if glu_stats.is_active():  # --log-glu-stats: logit magnitude
+            glu_stats.record_logits(logits)
 
         # Restore sequence parallel execution to the output layer if necessary.
         if sequence_parallel_override:
