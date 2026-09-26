@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Optional, Protocol
 
 import torch
+from megatron.core.transformer import glu_stats
 
 from megatron.core import parallel_state, tensor_parallel, utils
 from megatron.core.extensions.transformer_engine import HAVE_TE
@@ -423,6 +424,8 @@ class MoELayer(BaseMoELayer):
             # same order as hidden_states.reshape(-1, hidden_size).
             padding_mask = padding_mask.transpose(0, 1).bool()
         probs, routing_map = apply_module(self.router)(hidden_states, padding_mask)
+        if glu_stats.is_active():  # --log-glu-stats: expert load per layer
+            glu_stats.record_router(self.layer_number, routing_map)
         return probs, routing_map
 
     @maybe_skip_or_early_return_by_cudagraph("preprocess")

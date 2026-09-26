@@ -2482,6 +2482,14 @@ def _add_network_size_args(parser):
                        help='Use SiTU: gate f(x)=sigmoid(x)*tanh(x), output f(x_glu)*x_linear. '
                        'Non-learnable; implies gated linear units. No fused kernel (runs through '
                        'the generic GLU path).')
+    group.add_argument('--log-glu-stats', action='store_true',
+                       help='Log per-layer GLU gate statistics to TensorBoard/wandb (see '
+                       'megatron/core/transformer/glu_stats.py): moments of z1, z2, f(z2), h and '
+                       'dz1/dz2, simulated FP8/MXFP4/NVFP4 flush + error of h and dz2, dead-zone '
+                       'and dead-unit fractions, outlier-channel ratio, residual stream, logits '
+                       'and router load. Computed only every --glu-stats-interval iterations.')
+    group.add_argument('--glu-stats-interval', type=int, default=50,
+                       help='Iterations between --log-glu-stats logging steps.')
     group.add_argument('--exp-gate', type=str, default=None,
                        help='Activation-sweep gate by name from megatron/core/exp_gates.py, e.g. '
                        'exp_l0m1r0_p0.5_b1 (rsqrt bump) or exp_arglu. Non-learnable; implies gated '

@@ -10,6 +10,7 @@ from typing import Optional, Protocol, cast
 
 import numpy as np
 import torch
+from megatron.core.transformer import glu_stats
 import torch.nn.functional as F
 
 from megatron.core.dist_checkpointing import ShardedTensor
@@ -504,7 +505,11 @@ class MLP(MegatronModule):
                         x_glu = x_glu.clamp(min=None, max=val)
                         x_linear = x_linear.clamp(min=-val, max=val)
                     gate = self.config.activation_func(x_glu)
-                    return gate * (x_linear + self.config.glu_linear_offset)
+                    out = gate * (x_linear + self.config.glu_linear_offset)
+                    if glu_stats.is_active():  # --log-glu-stats, logging steps only
+                        glu_stats.record_glu("shared" if type(self).__name__ == "SharedExpertMLP" else "dense", x_linear, x_glu, gate, out,
+                                             self.config.activation_func, None)
+                    return out
 
                 intermediate_parallel = glu(intermediate_parallel)
             elif self.config.xpr:

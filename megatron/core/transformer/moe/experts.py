@@ -10,6 +10,7 @@ from math import ceil
 from typing import Optional, Protocol, Tuple
 
 import torch
+from megatron.core.transformer import glu_stats
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
@@ -558,7 +559,11 @@ class TEGroupedMLP(MegatronModule):
                         x_glu = x_glu.clamp(min=None, max=val)
                         x_linear = x_linear.clamp(min=-val, max=val)
                     gate = self.config.activation_func(x_glu)
-                    return gate * (x_linear + self.config.glu_linear_offset)
+                    out = gate * (x_linear + self.config.glu_linear_offset)
+                    if glu_stats.is_active():  # --log-glu-stats, logging steps only
+                        glu_stats.record_glu("routed", x_linear, x_glu, gate, out,
+                                             self.config.activation_func, tokens_per_expert)
+                    return out
 
                 intermediate_parallel = glu(intermediate_parallel)
             elif self.config.xpr:

@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 
 import torch
+from megatron.core.transformer import glu_stats
 import torch.distributed
 from torch import Tensor
 
@@ -846,12 +847,15 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         This method calls the core computation of a transformer layer, including
         self-attention, cross-attention (if applicable), and feed-forward operations.
         """
+        glu_stats.set_layer(self.layer_number)
         hidden_states, context = self._forward_attention(*args, **kwargs)
         output = self._forward_mlp(
             hidden_states,
             kwargs.get("inference_context", None),
             padding_mask=kwargs.get("padding_mask", None),
         )
+        if glu_stats.is_active():  # --log-glu-stats: residual-stream magnitude per layer
+            glu_stats.record_moments("resid", output)
         return output, context
 
     def _forward_pre_mlp_layernorm(self, hidden_states: Tensor):
