@@ -158,6 +158,105 @@ def test_inactive_is_noop():
     assert not gs._T.sums and gs.reduce_and_log(1) is None
 
 
+def test_weight_2d_blocks_transpose_invariant():
+    torch.manual_seed(2)
+    w = torch.randn(64, 48, device=DEV) * torch.logspace(-2, 1, 48, device=DEV)
+    for fmt in ("nvfp4", "fp8"):
+        assert torch.equal(gs.qdq_weight(w, fmt).t(), gs.qdq_weight(w.t(), fmt)), fmt
+    # MXFP4 is 1D: blocks follow the contraction dim
+    assert torch.equal(gs.qdq_weight(w, "mxfp4", 0), gs.qdq(w.t(), "mxfp4").t())
+
+
+def test_rht_is_orthogonal():
+    torch.manual_seed(3)
+    a, b = torch.randn(8, 64, device=DEV), torch.randn(5, 64, device=DEV)
+    ref = a @ b.t()
+    got = gs._rht16(a) @ gs._rht16(b).t()
+    assert ((got - ref).norm() / ref.norm()).item() < 1e-5
+
+
+def test_stochastic_rounding_unbiased():
+    g = torch.Generator(device=DEV).manual_seed(0)
+    y = torch.full((400_000,), 0.3, device=DEV)
+    m = gs._sr_e2m1(y, g).mean().item()
+    print(f"  SR mean of 0.3: {m:.4f}")
+    assert abs(m - 0.3) < 0.003, m
+    grid = torch.tensor([0, .5, 1, 1.5, 2, 3, 4, 6, -.5, -6], device=DEV)
+    assert torch.equal(gs._sr_e2m1(grid, g), grid)
+
+
+def test_nvfp4_scale_underflow_and_max_over_median():
+    gs.begin_step(True, num_layers=1)
+    x = torch.ones(1, 32, device=DEV)
+    x[0, :16] = 1e-8                     # block 0: tiny, its E4M3 scale underflows
+    x[0, 16] = 1e4                       # block 1 holds the tensor max
+    gs._tensor_stats("t", 1, x, quant=True)
+    S = gs._T.sums
+    assert S["t/nvfp4/blocks"][1].item() == 2
+    assert S["t/nvfp4/scale_underflow"][1].item() == 1
+    gs.begin_step(True, num_layers=1)
+    y = torch.ones(1, 4096, device=DEV); y[0, 7] = 100.0
+    gs._tensor_stats("u", 1, y, quant=True)
+    r = gs._T.sums["u/mom_sum"][1].item()
+    assert abs(r - 100.0) < 1e-6, r
+
+
+class _NS:
+    def __init__(self, **kw):
+        self.__dict__.update(kw)
+
+
+def _fake_experts_step(stash_input=True, corrupt_input=False):
+    torch.manual_seed(4)
+    F, K, H, n = 32, 48, 40, 256
+    gate = eg.GATES["exp_l0m1r0_p1_b1"]
+    W1 = [torch.randn(2 * F, K, device=DEV) / K ** .5 for _ in range(2)]
+    W1[0][F] = W1[0][0]                  # expert 0, unit 0: gate row == value row
+    W1 = [w.requires_grad_(True) for w in W1]
+    W2 = [(torch.randn(H, F, device=DEV) / F ** .5).requires_grad_(True) for _ in range(2)]
+    mod = _NS(linear_fc1=_NS(weight0=W1[0], weight1=W1[1]),
+              linear_fc2=_NS(weight0=W2[0], weight1=W2[1]))
+    x = torch.randn(2 * n, K, device=DEV)
+    out = torch.cat([x[:n] @ W1[0].t(), x[n:] @ W1[1].t()])
+    z2, z1 = torch.chunk(out, 2, dim=-1)
+    g = gate(z2); h = g * z1
+    gs.begin_step(True, num_layers=2, num_experts=2)
+    gs.set_layer(1)
+    if stash_input:
+        gs.stash_fc1_input(x * 3.0 if corrupt_input else x)
+    gs.record_glu("routed", z1, z2, g, h, gate, [n, n], fc1_out=out, module=mod)
+    y = torch.cat([h[:n] @ W2[0].t(), h[n:] @ W2[1].t()])
+    y.pow(2).sum().backward()
+    return gs.reduce_and_log(iteration=7)
+
+
+def test_gemm_weight_align_end_to_end():
+    sc = _fake_experts_step()
+    assert all(math.isfinite(v) for v in sc.values())
+    wc, zc = sc["gate-align/routed/w_cos_abs_max"], sc["gate-align/routed/z_corr_abs_max"]
+    print(f"  planted unit: max|cos(Wg,Wv)| {wc:.4f}  max|corr(z1,z2)| {zc:.4f}")
+    assert abs(wc - 1) < 1e-5 and abs(zc - 1) < 1e-4
+    assert sc["gate-align/routed/w_cos_abs_mean"] < 0.5
+    e = {k.split("/")[-1]: v for k, v in sc.items() if k.startswith("gemm-quant/routed/")}
+    print("  GEMM relerr: " + ", ".join(f"{k.replace('_relerr', '')} {v:.3g}"
+                                          for k, v in sorted(e.items())))
+    for op in ("fc2_fprop", "fc1_dgrad", "fc1_wgrad"):
+        assert e[f"{op}_fp8_relerr"] < e[f"{op}_nvfp4_relerr"] < 0.5, op
+        assert e[f"{op}_nvfp4_relerr"] < e[f"{op}_mxfp4_relerr"] * 1.5, op
+    assert "fc1_wgrad_nvfp4_plain_relerr" in e and "fc1_wgrad_nvfp4_rht_relerr" in e
+    assert "skipped_samples" not in e
+    for w in ("fc1", "fc2"):
+        assert sc[f"weight-quant/routed/{w}_fp8_relerr"] < sc[f"weight-quant/routed/{w}_nvfp4_relerr"]
+    assert "layers-gemm-quant/routed/fc1_wgrad_nvfp4_relerr/L01" in sc
+
+
+def test_gemm_skipped_when_input_mismatch():
+    sc = _fake_experts_step(corrupt_input=True)
+    assert sc["gemm-quant/routed/skipped_samples"] >= 1
+    assert "gemm-quant/routed/fc1_dgrad_nvfp4_relerr" not in sc
+    assert "gemm-quant/routed/fc2_fprop_nvfp4_relerr" in sc      # needs no fc1 input
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

@@ -24,20 +24,39 @@ For a GLU  h = z1 * f(z2)  (z2 = gate input, f = the gate, h = input of fc2):
              fraction of hidden units (per expert) that are in the dead zone for
              more than 99% of their tokens.
   outliers   outlier-channel ratio: max / median over hidden units of the
-             per-unit RMS of h (the "stripes" of per-channel heatmaps).
+             per-unit RMS of h (the "stripes" of per-channel heatmaps), and
+             max|x| / median|x| of h and dz2 (median from a 1M-element subsample).
+  nvfp4 scale fraction of NVFP4 blocks whose E4M3 block scale underflows to 0
+             (whole block lost) or is subnormal (< 2^-6, reduced scale precision).
+
+Once per (site, layer) per logging step, on one expert / up to 2048 tokens:
+  gemm       relative error of the actual matmul outputs under each recipe vs an
+             fp32 reference: fc2 Fprop  h @ W2^T  (activations 1xB, weights
+             FP8 128x128 / MXFP4 1x32 / NVFP4 16x16), fc1 Dgrad  dz @ W1  (NVFP4
+             with stochastic rounding on dz), and fc1 Wgrad  dz^T @ x  blocked
+             along tokens (NVFP4 = 16x16 random Hadamard + SR on dz, as in the
+             NVIDIA recipe; nvfp4_rht = RHT only; nvfp4_plain = neither). The fc1 input x is
+             checked by recomputing fc1 in fp32; backward GEMMs are skipped when it
+             does not match (e.g. fused-LayerNorm fc1 in the dense layer).
+  weights    flush + relative error of W1 (fc1) and W2 (fc2) quantized with the
+             weight recipes above (up to 8 local experts).
+  alignment  per-unit |cos| between gate and value weight rows of W1 and per-unit
+             |corr(z1, z2)| over tokens: the SwiGLU weight alignment that makes the
+             output quadratic (Fishman et al., arXiv 2409.12517).
 
 Sites: "routed" (MoE experts), "shared" (shared expert), "dense" (dense MLP
 layers), "resid" (transformer-layer output), "logits" (first 64 positions of the
 LM head output) and "router" (tokens per expert: CV, max/mean, dead experts).
 
 Tags: layer averages under gate-quant/, gate-outliers/, gate-deadzone/, gate-moments/,
-residual/, logits/, router/ (e.g. gate-quant/routed/h_mxfp4_flush); a curated subset
+gemm-quant/, weight-quant/, gate-align/, residual/, logits/, router/ (e.g. gate-quant/routed/h_mxfp4_flush); a curated subset
 per layer under layers-<section>/.../L<nn>.
 """
 import math
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as Fn
 
 # ---- low-precision simulators ------------------------------------------------
 FORMATS = ("fp8", "mxfp4", "nvfp4")
@@ -50,6 +69,12 @@ FLOORS = {"fp8": 2.0 ** -9 / _FP8_MAX, "fp4": 0.5 / 6.0}
 _DEAD_UNIT_FRAC = 0.99
 _CHUNK = 1 << 24            # elements per chunk (bounds the fp32 temporaries)
 _LOGIT_POSITIONS = 64
+_WGT_2D = {"fp8": 128, "nvfp4": 16}   # weight blocks: DeepSeek-V3 128x128, NVFP4 16x16; MXFP4 1x32
+_GEMM_ROWS = 2048                      # tokens per GEMM-error sample
+_MIN_ROWS = 32
+_MAX_WEIGHT_EXPERTS = 8                # local experts per rank for weight / alignment stats
+_MEDIAN_SAMPLE = 1 << 20
+_FP8_SUBNORMAL = 2.0 ** -6
 
 GLU_SITES = ("routed", "shared", "dense")
 GLU_TENSORS = ("z1", "z2", "g", "h", "dz1", "dz2")
@@ -66,28 +91,81 @@ def _blocks(x, b):
 def _round_e2m1(y):
     grid = torch.tensor(_E2M1_GRID, device=y.device, dtype=y.dtype)
     mids = torch.tensor(_E2M1_MIDS, device=y.device, dtype=y.dtype)
-    return torch.sign(y) * grid[torch.bucketize(y.abs().clamp(max=6.0), mids)]
+    return torch.sign(y) * grid[torch.bucketize(y.abs().clamp(max=6.0).contiguous(), mids)]
 
 
-def fake_quant(x, fmt, tensor_amax=None):
-    """Quantize-dequantize float32 x [..., D] blocked along D. Returns (x_blocks, q_blocks)."""
-    xb = _blocks(x, _BLOCK[fmt])
+def _sr_e2m1(y, gen):
+    """Stochastic rounding onto the e2m1 grid (unbiased: E[round(y)] = y for |y| <= 6)."""
+    grid = torch.tensor(_E2M1_GRID, device=y.device, dtype=y.dtype)
+    a = y.abs().clamp(max=6.0)
+    i = (torch.bucketize(a.contiguous(), grid, right=True) - 1).clamp(0, len(_E2M1_GRID) - 1)
+    lo, hi = grid[i], grid[(i + 1).clamp(max=len(_E2M1_GRID) - 1)]
+    p = torch.where(hi > lo, (a - lo) / (hi - lo), torch.zeros_like(a))
+    u = torch.rand(a.shape, device=a.device, dtype=a.dtype, generator=gen)
+    return torch.sign(y) * torch.where(u < p, hi, lo)
+
+
+def _scale_q(xb, fmt, tensor_amax, sr=False, gen=None):
+    """Quantize-dequantize blocks xb [..., nblocks, blocksize] (scale per block)."""
     amax = xb.abs().amax(-1, keepdim=True)
+    rnd = (lambda y: _sr_e2m1(y, gen)) if sr else _round_e2m1
     if fmt == "fp8":
         s = (amax / _FP8_MAX).clamp(min=1e-30)
-        q = (xb / s).to(torch.float8_e4m3fn).float() * s
-    elif fmt == "mxfp4":
+        return (xb / s).to(torch.float8_e4m3fn).float() * s
+    if fmt == "mxfp4":
         s = torch.exp2(torch.floor(torch.log2(amax.clamp(min=1e-30))) - 2.0)
-        q = _round_e2m1(xb / s) * s
-    elif fmt == "nvfp4":
-        ta = x.abs().amax() if tensor_amax is None else tensor_amax
-        s_t = (ta / (_FP8_MAX * 6.0)).clamp(min=1e-30)
+        return rnd(xb / s) * s
+    if fmt == "nvfp4":
+        s_t = (tensor_amax / (_FP8_MAX * 6.0)).clamp(min=1e-30)
         s_b = (amax / (6.0 * s_t)).to(torch.float8_e4m3fn).float()
         s = torch.where(s_b > 0, s_b, torch.ones_like(s_b)) * s_t
-        q = _round_e2m1(xb / s) * s
-    else:
-        raise ValueError(fmt)
-    return xb, q
+        return rnd(xb / s) * s
+    raise ValueError(fmt)
+
+
+def fake_quant(x, fmt, tensor_amax=None, sr=False, gen=None):
+    """Quantize-dequantize float32 x [..., D] blocked along D. Returns (x_blocks, q_blocks)."""
+    xb = _blocks(x, _BLOCK[fmt])
+    ta = x.abs().amax() if tensor_amax is None else tensor_amax
+    return xb, _scale_q(xb, fmt, ta, sr, gen)
+
+
+def qdq(x, fmt, sr=False, gen=None):
+    """Quantize-dequantize along the last dim; float32 result with x's shape."""
+    D = x.shape[-1]
+    _, q = fake_quant(x.float(), fmt, None, sr, gen)
+    return q.reshape(*x.shape[:-1], -1)[..., :D]
+
+
+def qdq_weight(w, fmt, contract_dim=1):
+    """Weight quantize-dequantize: FP8 128x128 / NVFP4 16x16 2D blocks (transpose-invariant),
+    MXFP4 1x32 blocks along the GEMM's contraction dim of w."""
+    w = w.float()
+    if fmt not in _WGT_2D:
+        return qdq(w, fmt) if contract_dim == 1 else qdq(w.t(), fmt).t()
+    b, (N, K) = _WGT_2D[fmt], w.shape
+    wp = Fn.pad(w, (0, (-K) % b, 0, (-N) % b))
+    Np, Kp = wp.shape
+    blk = wp.reshape(Np // b, b, Kp // b, b).permute(0, 2, 1, 3).reshape(Np // b, Kp // b, b * b)
+    q = _scale_q(blk, fmt, w.abs().amax())
+    return q.reshape(Np // b, Kp // b, b, b).permute(0, 2, 1, 3).reshape(Np, Kp)[:N, :K]
+
+
+_HAD = {}
+
+
+def _rht16(x):
+    """Random Hadamard transform (16x16, one fixed random sign vector) along the last dim,
+    which must be a multiple of 16. Orthogonal: rht(A) @ rht(B).T == A @ B.T."""
+    R = _HAD.get(x.device)
+    if R is None:
+        H = torch.ones(1, 1)
+        while H.shape[0] < 16:
+            H = torch.cat([torch.cat([H, H], 1), torch.cat([H, -H], 1)], 0)
+        g = torch.Generator().manual_seed(16)
+        d = torch.randint(0, 2, (16,), generator=g).float() * 2 - 1
+        R = _HAD[x.device] = ((H / 4.0) * d).to(x.device)       # H @ diag(d)
+    return (x.reshape(*x.shape[:-1], -1, 16) @ R.t()).reshape(x.shape)
 
 
 # ---- tracker -----------------------------------------------------------------
@@ -98,6 +176,9 @@ class _Tracker:
         self.num_slots = 2          # index 0 = model-level (logits), 1..L = layers
         self.num_experts = 1
         self.sums, self.maxs, self.vecs = {}, {}, {}
+        self.done = set()           # (site, layer) with once-per-step stats already taken
+        self.fc1_in = None          # fc1 input of the GLU about to run (see stash_fc1_input)
+        self.gen = None             # private RNG for stochastic rounding (training RNG untouched)
 
 
 _T = _Tracker()
@@ -116,6 +197,14 @@ def begin_step(active, num_layers, num_experts=None):
     _T.num_slots = int(num_layers) + 2
     _T.num_experts = max(int(num_experts or 1), 1)
     _T.sums.clear(); _T.maxs.clear(); _T.vecs.clear()
+    _T.done.clear(); _T.fc1_in = None
+
+
+def _gen():
+    if _T.gen is None:
+        _T.gen = torch.Generator(device="cuda")
+        _T.gen.manual_seed(20260926 + (dist.get_rank() if dist.is_initialized() else 0))
+    return _T.gen
 
 
 def _slot(layer):
@@ -153,6 +242,14 @@ def _tensor_stats(prefix, layer, x, quant=False):
     tmax = x2.abs().amax().float()
     _max(prefix + "/absmax", layer, tmax)
     _add(prefix + "/count", layer, float(x2.numel()))
+    if quant:
+        flat = x2.reshape(-1)
+        med = flat[::max(1, flat.numel() // _MEDIAN_SAMPLE)].abs().float().median()
+        if med > 0:
+            r = tmax / med
+            _add(prefix + "/mom_sum", layer, r.double())
+            _add(prefix + "/mom_n", layer, 1.0)
+            _max(prefix + "/mom_max", layer, r)
     for c in x2.split(max(1, _CHUNK // x2.shape[-1])):
         cf = c.float()
         sq = cf * cf
@@ -165,6 +262,16 @@ def _tensor_stats(prefix, layer, x, quant=False):
                 _add(f"{prefix}/{fmt}/nonzero", layer, nz.sum(dtype=torch.float64))
                 _add(f"{prefix}/{fmt}/flushed", layer, (nz & (q == 0)).sum(dtype=torch.float64))
                 _add(f"{prefix}/{fmt}/errsq", layer, (q - xb).pow(2).sum(dtype=torch.float64))
+                if fmt == "nvfp4":
+                    bmax = xb.abs().amax(-1)
+                    s_b = (bmax / (6.0 * (tmax / (_FP8_MAX * 6.0)).clamp(min=1e-30))).to(
+                        torch.float8_e4m3fn).float()
+                    live = bmax > 0
+                    _add(f"{prefix}/nvfp4/blocks", layer, live.sum(dtype=torch.float64))
+                    _add(f"{prefix}/nvfp4/scale_underflow", layer,
+                         (live & (s_b == 0)).sum(dtype=torch.float64))
+                    _add(f"{prefix}/nvfp4/scale_subnormal", layer,
+                         (live & (s_b > 0) & (s_b < _FP8_SUBNORMAL)).sum(dtype=torch.float64))
 
 
 def _unit_stats(site, layer, z2, h, gate_fn, tokens_per_expert):
@@ -211,6 +318,121 @@ def _unit_stats(site, layer, z2, h, gate_fn, tokens_per_expert):
         _max(f"{site}/h/och_ratio_max", layer, ratio)
 
 
+def _get_weights(module, e):
+    """(W1 [2F, K], W2 [K', F]) of local expert e (grouped experts) or of an MLP, as fp32."""
+    out = []
+    for name in ("linear_fc1", "linear_fc2"):
+        lin, w = getattr(module, name, None), None
+        if lin is not None:
+            w = getattr(lin, f"weight{e}", None) if e is not None else None
+            if w is None:
+                w = getattr(lin, "weight", None)
+        try:
+            out.append(w.detach().float() if torch.is_tensor(w) and w.dim() == 2 else None)
+        except Exception:  # noqa: BLE001  (e.g. a quantized parameter type)
+            out.append(None)
+    return out
+
+
+def _stat(key, layer, vals):
+    _add(key + "/sum", layer, vals.sum(dtype=torch.float64))
+    _add(key + "/n", layer, float(vals.numel()))
+    _max(key + "/max", layer, vals.max())
+
+
+def _gemm_err(key, layer, ref, approx):
+    _add(key + "/errsq", layer, (approx - ref).pow(2).sum(dtype=torch.float64))
+    _add(key + "/refsq", layer, ref.pow(2).sum(dtype=torch.float64))
+
+
+def _weight_q(prefix, layer, w, contract_dim):
+    nz = w != 0
+    for fmt in FORMATS:
+        q = qdq_weight(w, fmt, contract_dim)
+        _add(f"{prefix}_{fmt}/nonzero", layer, nz.sum(dtype=torch.float64))
+        _add(f"{prefix}_{fmt}/flushed", layer, (nz & (q == 0)).sum(dtype=torch.float64))
+        _add(f"{prefix}_{fmt}/errsq", layer, (q - w).pow(2).sum(dtype=torch.float64))
+        _add(f"{prefix}_{fmt}/refsq", layer, w.pow(2).sum(dtype=torch.float64))
+
+
+def _colcorr(a, b):
+    a, b = a - a.mean(0), b - b.mean(0)
+    return (a * b).sum(0) / (a.norm(dim=0) * b.norm(dim=0)).clamp(min=1e-30)
+
+
+def _deep_stats(site, layer, z1, z2, h, fc1_out, fc1_in, module, tokens_per_expert):
+    F_ = z2.shape[-1]
+    z1d, z2d, hd = (t.detach().reshape(-1, F_) for t in (z1, z2, h))
+    N = z2d.shape[0]
+    grouped = tokens_per_expert is not None
+    counts = [int(c) for c in torch.as_tensor(tokens_per_expert).flatten().tolist()] \
+        if grouped else [N]
+    starts = [sum(counts[:i]) for i in range(len(counts))]
+    # weight alignment + weight quantization over up to 8 local experts
+    for e in (range(min(len(counts), _MAX_WEIGHT_EXPERTS)) if grouped else [None]):
+        w1, w2 = _get_weights(module, e) if module is not None else (None, None)
+        if w1 is not None and w1.shape[0] == 2 * F_:
+            g, v = w1[:F_], w1[F_:]
+            cos = (g * v).sum(1) / (g.norm(dim=1) * v.norm(dim=1)).clamp(min=1e-30)
+            _stat(f"{site}/align/w_cos_abs", layer, cos.abs())
+            _stat(f"{site}/align/w_cos", layer, cos)
+            _weight_q(f"{site}/wq/fc1", layer, w1, 1)
+        if w2 is not None and w2.shape[1] == F_:
+            _weight_q(f"{site}/wq/fc2", layer, w2, 1)
+    # GEMM errors + activation correlation on one expert's tokens
+    cand = [i for i, c in enumerate(counts) if c >= _MIN_ROWS and starts[i] + c <= N]
+    if not cand:
+        return
+    e = cand[0]
+    rows = slice(starts[e], starts[e] + min(counts[e], _GEMM_ROWS))
+    _stat(f"{site}/align/z_corr_abs", layer,
+          _colcorr(z1d[rows].float(), z2d[rows].float()).abs())
+    w1, w2 = _get_weights(module, e if grouped else None) if module is not None else (None, None)
+    if w2 is not None and w2.shape[1] == F_:
+        hs = hd[rows].float()
+        ref = hs @ w2.t()
+        for fmt in FORMATS:
+            _gemm_err(f"{site}/gemm/fc2_fprop_{fmt}", layer, ref,
+                      qdq(hs, fmt) @ qdq_weight(w2, fmt, 1).t())
+    if (w1 is None or w1.shape[0] != 2 * F_ or fc1_out is None or fc1_in is None
+            or not fc1_out.requires_grad or fc1_in.shape[-1] != w1.shape[1]):
+        return
+    xin = fc1_in.detach().reshape(-1, fc1_in.shape[-1])
+    if xin.shape[0] != N:
+        return
+    xin = xin[rows].float()
+    out = fc1_out.detach().reshape(-1, 2 * F_)[rows].float()
+    mism = ((xin @ w1.t() - out).norm() / out.norm().clamp(min=1e-30)).item()
+    if mism > 0.02:                 # stashed input is not the real GEMM input: skip
+        _add(f"{site}/gemm/skipped", layer, 1.0)
+        return
+    fc1_out.register_hook(
+        lambda g, s=site, l=layer, r=rows, x=xin, w=w1: _bwd_gemm_hook(s, l, r, x, w, g))
+
+
+def _bwd_gemm_hook(site, layer, rows, xin, w1, grad):
+    if not _T.active or grad is None:
+        return
+    with torch.no_grad():
+        dz = grad.detach().reshape(-1, grad.shape[-1])[rows].float()      # [n, 2F]
+        ref = dz @ w1                                                     # Dgrad, contract 2F
+        for fmt in FORMATS:
+            A = qdq(dz, fmt, sr=fmt == "nvfp4", gen=_gen())
+            _gemm_err(f"{site}/gemm/fc1_dgrad_{fmt}", layer, ref, A @ qdq_weight(w1, fmt, 0))
+        pad = (-dz.shape[0]) % 16                                         # Wgrad, contract tokens
+        dzT, xT = Fn.pad(dz.t(), (0, pad)), Fn.pad(xin.t(), (0, pad))
+        ref = dzT @ xT.t()
+        # nvfp4 = full NVIDIA recipe (RHT + SR on dz); nvfp4_rht = RHT only; nvfp4_plain = neither.
+        # SR raises the single-sample error but removes bias across steps, so compare the three.
+        for name, fmt, rht, sr in (("fp8", "fp8", False, False), ("mxfp4", "mxfp4", False, False),
+                                   ("nvfp4", "nvfp4", True, True),
+                                   ("nvfp4_rht", "nvfp4", True, False),
+                                   ("nvfp4_plain", "nvfp4", False, False)):
+            a, b = (_rht16(dzT), _rht16(xT)) if rht else (dzT, xT)
+            approx = qdq(a, fmt, sr=sr, gen=_gen()) @ qdq(b, fmt).t()
+            _gemm_err(f"{site}/gemm/fc1_wgrad_{name}", layer, ref, approx)
+
+
 def _grad_hook(site, name, layer, grad):
     if _T.active and grad is not None:
         with torch.no_grad():
@@ -218,17 +440,29 @@ def _grad_hook(site, name, layer, grad):
 
 
 # ---- recording entry points (all no-ops unless active) -------------------------
-def record_glu(site, z1, z2, gate, h, gate_fn, tokens_per_expert=None):
-    """Called from the generic GLU paths with z1 (value), z2 (gate input), gate = f(z2), h."""
+def stash_fc1_input(x):
+    """Called right before fc1 so the next record_glu() knows the GEMM input."""
+    if _T.active:
+        _T.fc1_in = x
+
+
+def record_glu(site, z1, z2, gate, h, gate_fn, tokens_per_expert=None, fc1_out=None,
+               module=None):
+    """Called from the generic GLU paths with z1 (value), z2 (gate input), gate = f(z2), h,
+    the full fc1 output [z2 | z1] and the owning MLP / experts module (for its weights)."""
     if not _T.active:
         return
     layer = _T.layer
+    fc1_in, _T.fc1_in = _T.fc1_in, None
     with torch.no_grad():
         _tensor_stats(f"{site}/z1", layer, z1)
         _tensor_stats(f"{site}/z2", layer, z2)
         _tensor_stats(f"{site}/g", layer, gate)
         _tensor_stats(f"{site}/h", layer, h, quant=True)
         _unit_stats(site, layer, z2, h, gate_fn, tokens_per_expert)
+        if (site, layer) not in _T.done:
+            _T.done.add((site, layer))
+            _deep_stats(site, layer, z1, z2, h, fc1_out, fc1_in, module, tokens_per_expert)
     if z2.requires_grad:
         z2.register_hook(lambda g, s=site, l=layer: _grad_hook(s, "dz2", l, g))
     if z1.requires_grad:
@@ -320,6 +554,14 @@ def _metrics(S, M, V):
             if rms > 0:
                 put(site, f"{tensor}/crest", l, amax / rms)
                 put(site, f"{tensor}/kurtosis", l, (S[prefix + "/sum4"][l] / c) / ms ** 2)
+            mn = S.get(prefix + "/mom_n")
+            if mn is not None and mn[l] > 0:
+                put(site, f"{tensor}/max_over_median", l, S[prefix + "/mom_sum"][l] / mn[l])
+                put(site, f"{tensor}/max_over_median_max", l, M[prefix + "/mom_max"][l])
+            blk = S.get(prefix + "/nvfp4/blocks")
+            if blk is not None and blk[l] > 0:
+                for k in ("scale_underflow", "scale_subnormal"):
+                    put(site, f"{tensor}/nvfp4_{k}", l, S[f"{prefix}/nvfp4/{k}"][l] / blk[l])
             for fmt in FORMATS:
                 nz = S.get(f"{prefix}/{fmt}/nonzero")
                 if nz is None or nz[l] <= 0:
@@ -346,6 +588,28 @@ def _metrics(S, M, V):
             if n[l] > 0:
                 put(site, "h/outlier_channel_ratio", l, sm[l] / n[l])
                 put(site, "h/outlier_channel_ratio_max", l, mx[l])
+        for key in S:
+            if not key.startswith(site + "/"):
+                continue
+            rest = key[len(site) + 1:]
+            for l in range(len(S[key])):
+                if rest.startswith(("gemm/", "wq/")) and rest.endswith("/errsq"):
+                    base = rest[:-len("/errsq")]
+                    ref = S[f"{site}/{base}/refsq"][l]
+                    if ref > 0:
+                        put(site, f"{base}_relerr", l, math.sqrt(S[key][l] / ref))
+                    if rest.startswith("wq/") and S[f"{site}/{base}/nonzero"][l] > 0:
+                        put(site, f"{base}_flush", l,
+                            S[f"{site}/{base}/flushed"][l] / S[f"{site}/{base}/nonzero"][l])
+                elif rest.startswith("align/") and rest.endswith("/sum"):
+                    base, nn = rest[:-len("/sum")], S[f"{site}/{rest[:-len('/sum')]}/n"][l]
+                    if nn > 0:
+                        put(site, f"{base}_mean", l, S[key][l] / nn)
+                        mk = M.get(f"{site}/{base}/max")
+                        if mk is not None and base.endswith("_abs"):
+                            put(site, f"{base}_max", l, mk[l])
+                elif rest == "gemm/skipped" and S[key][l] > 0:
+                    put(site, "gemm/skipped_samples", l, S[key][l])
     moments("resid", "x", "resid")
     moments("logits", "x", "logits")
     for l, vec in enumerate(V.get("router/tokens_per_expert", [])):
@@ -369,19 +633,27 @@ _SITE_SECTION = {"resid": "residual", "logits": "logits", "router": "router"}
 _PER_LAYER = {
     "h/rms", "h/crest", "h/kurtosis", "h/mxfp4_flush", "h/nvfp4_flush", "dz2/rms",
     "dz2/mxfp4_flush", "deadzone_fp4", "dead_units_fp4", "h/outlier_channel_ratio",
-    "x/rms", "x/absmax", "load_cv", "dead_experts",
+    "x/rms", "x/absmax", "load_cv", "dead_experts", "h/max_over_median",
+    "h/nvfp4_scale_underflow", "gemm/fc2_fprop_nvfp4_relerr", "gemm/fc1_dgrad_nvfp4_relerr",
+    "gemm/fc1_wgrad_nvfp4_relerr", "wq/fc1_nvfp4_relerr", "wq/fc2_nvfp4_relerr",
+    "align/w_cos_abs_mean", "align/z_corr_abs_mean",
 }
+_PREFIX_SECTION = {"gemm/": "gemm-quant", "wq/": "weight-quant", "align/": "gate-align"}
 
 
 def _tag(site, metric):
     """(site, metric) -> (section, leaf)."""
     if site in _SITE_SECTION:
         return _SITE_SECTION[site], metric.replace("x/", "")
-    if metric.endswith(("_flush", "_relerr")):
+    for pre, sec in _PREFIX_SECTION.items():
+        if metric.startswith(pre):
+            return sec, f"{site}/{metric[len(pre):]}"
+    if metric.endswith(("_flush", "_relerr", "_underflow", "_subnormal")):
         section = "gate-quant"
     elif metric.startswith(("deadzone", "dead_units")):
         section = "gate-deadzone"
-    elif metric.endswith(("crest", "kurtosis")) or "outlier_channel" in metric:
+    elif metric.endswith(("crest", "kurtosis")) or "outlier_channel" in metric \
+            or "max_over_median" in metric:
         section = "gate-outliers"
     else:
         section = "gate-moments"
@@ -425,6 +697,13 @@ def reduce_and_log(iteration, writer=None, wandb_writer=None):
               f"{g('gate-quant/routed/dz2_mxfp4_flush')} | dead units fp4 routed/shared/dense "
               f"{g('gate-deadzone/routed/dead_units_fp4')}/{g('gate-deadzone/shared/dead_units_fp4')}/"
               f"{g('gate-deadzone/dense/dead_units_fp4')} | resid rms {g('residual/rms')} | logits "
-              f"absmax {g('logits/absmax')} | router cv {g('router/load_cv')}",
+              f"absmax {g('logits/absmax')} | router cv {g('router/load_cv')} | nvfp4 GEMM "
+              f"relerr fprop/dgrad/wgrad {g('gemm-quant/routed/fc2_fprop_nvfp4_relerr')}/"
+              f"{g('gemm-quant/routed/fc1_dgrad_nvfp4_relerr')}/"
+              f"{g('gemm-quant/routed/fc1_wgrad_nvfp4_relerr')} (plain "
+              f"{g('gemm-quant/routed/fc1_wgrad_nvfp4_plain_relerr')}) | w-align "
+              f"{g('gate-align/routed/w_cos_abs_mean')} z-corr "
+              f"{g('gate-align/routed/z_corr_abs_mean')} | h max/median "
+              f"{g('gate-outliers/routed/h_max_over_median')}",
               flush=True)
     return scalars

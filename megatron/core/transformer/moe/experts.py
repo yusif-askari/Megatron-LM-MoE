@@ -562,7 +562,8 @@ class TEGroupedMLP(MegatronModule):
                     out = gate * (x_linear + self.config.glu_linear_offset)
                     if glu_stats.is_active():  # --log-glu-stats, logging steps only
                         glu_stats.record_glu("routed", x_linear, x_glu, gate, out,
-                                             self.config.activation_func, tokens_per_expert)
+                                             self.config.activation_func, tokens_per_expert,
+                                             fc1_out=x, module=self)
                     return out
 
                 intermediate_parallel = glu(intermediate_parallel)
@@ -649,6 +650,8 @@ class TEGroupedMLP(MegatronModule):
         with off_interface(
             self.offload_expert_fc1, permuted_local_hidden_states, "expert_fc1"
         ) as permuted_local_hidden_states:
+            if glu_stats.is_active():  # --log-glu-stats: GEMM input for error stats
+                glu_stats.stash_fc1_input(permuted_local_hidden_states)
             fc1_output, bias_parallel = apply_module(self.linear_fc1)(
                 permuted_local_hidden_states, tokens_per_expert
             )
