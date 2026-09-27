@@ -26,7 +26,10 @@ For a GLU  h = z1 * f(z2)  (z2 = gate input, f = the gate, h = input of fc2):
   outliers   outlier-channel ratio: per expert, max / median over its hidden units
              of the per-unit RMS of h (the "stripes" of per-channel heatmaps);
              token-weighted mean over experts with >= 32 tokens (and the worst
-             expert as ..._max), and
+             expert as ..._max). Alongside, per expert: fraction of channels with
+             RMS > 4x median (how many outliers), p90/median of the channel RMS
+             (uniformity of the bulk) and the energy share of the top-1% channels
+             (concentration), all token-weighted; and
              max|x| / median|x| of h and dz2 per call (exact max; median of a uniform random
              1M-element subsample), mean and max over calls.
   nvfp4 scale fraction of NVFP4 blocks whose E4M3 block scale underflows to 0
@@ -71,6 +74,8 @@ _E2M1_MIDS = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
 FLOORS = {"fp8": 2.0 ** -9 / _FP8_MAX, "fp4": 0.5 / 6.0}
 _DEAD_UNIT_FRAC = 0.99
 _MIN_CH_TOKENS = 32          # experts with fewer tokens are skipped for the outlier-channel ratio
+_OCH_K = 4.0                 # a channel counts as an outlier if its RMS > 4x the expert's median
+_OCH_TOP = 0.01              # top-1% channels for the energy-share metric
 _CHUNK = 1 << 24            # elements per chunk (bounds the fp32 temporaries)
 _LOGIT_POSITIONS = 64
 _WGT_2D = {"fp8": 128, "nvfp4": 16}   # weight blocks: DeepSeek-V3 128x128, NVFP4 16x16; MXFP4 1x32
@@ -327,6 +332,17 @@ def _unit_stats(site, layer, z2, h, gate_fn, tokens_per_expert):
         _add(f"{site}/h/och_ratio_wsum", layer, (ratio.double() * w).sum())
         _add(f"{site}/h/och_ratio_w", layer, w.sum())
         _max(f"{site}/h/och_ratio_max", layer, ratio.max())
+        # how many outlier channels, how uniform the bulk is, how concentrated the energy is
+        med = rms.median(1, keepdim=True).values.clamp(min=1e-30)
+        e = rms * rms
+        k = max(1, math.ceil(_OCH_TOP * F_))
+        extra = {
+            "outlier_frac": (rms > _OCH_K * med).float().mean(1),
+            "p90_over_median": torch.quantile(rms, 0.9, dim=1) / med.squeeze(1),
+            "top1pct_energy": e.topk(k, dim=1).values.sum(1) / e.sum(1).clamp(min=1e-30),
+        }
+        for name, v in extra.items():
+            _add(f"{site}/h/och_{name}_wsum", layer, (v.double() * w).sum())
 
 
 def _get_weights(module, e):
@@ -599,6 +615,10 @@ def _metrics(S, M, V):
             if n[l] > 0:
                 put(site, "h/outlier_channel_ratio", l, sm[l] / n[l])
                 put(site, "h/outlier_channel_ratio_max", l, mx[l])
+                for name in ("outlier_frac", "p90_over_median", "top1pct_energy"):
+                    v = S.get(f"{site}/h/och_{name}_wsum")
+                    if v is not None:
+                        put(site, f"h/och_{name}", l, v[l] / n[l])
         for key in S:
             if not key.startswith(site + "/"):
                 continue
@@ -647,7 +667,8 @@ _PER_LAYER = {
     "x/rms", "x/absmax", "load_cv", "dead_experts", "h/max_over_median",
     "h/nvfp4_scale_underflow", "gemm/fc2_fprop_nvfp4_relerr", "gemm/fc1_dgrad_nvfp4_relerr",
     "gemm/fc1_wgrad_nvfp4_relerr", "wq/fc1_nvfp4_relerr", "wq/fc2_nvfp4_relerr",
-    "align/w_cos_abs_mean", "align/z_corr_abs_mean",
+    "align/w_cos_abs_mean", "align/z_corr_abs_mean", "h/och_outlier_frac",
+    "h/och_p90_over_median", "h/och_top1pct_energy",
 }
 _PREFIX_SECTION = {"gemm/": "gemm-quant", "wq/": "weight-quant", "align/": "gate-align"}
 
@@ -664,7 +685,7 @@ def _tag(site, metric):
     elif metric.startswith(("deadzone", "dead_units")):
         section = "gate-deadzone"
     elif metric.endswith(("crest", "kurtosis")) or "outlier_channel" in metric \
-            or "max_over_median" in metric:
+            or "max_over_median" in metric or metric.startswith("h/och_"):
         section = "gate-outliers"
     else:
         section = "gate-moments"
