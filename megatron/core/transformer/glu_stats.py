@@ -25,7 +25,8 @@ For a GLU  h = z1 * f(z2)  (z2 = gate input, f = the gate, h = input of fc2):
              more than 99% of their tokens.
   outliers   outlier-channel ratio: max / median over hidden units of the
              per-unit RMS of h (the "stripes" of per-channel heatmaps), and
-             max|x| / median|x| of h and dz2 (median from a 1M-element subsample).
+             max|x| / median|x| of h and dz2 per call (exact max; median of a uniform random
+             1M-element subsample), mean and max over calls.
   nvfp4 scale fraction of NVFP4 blocks whose E4M3 block scale underflows to 0
              (whole block lost) or is subnormal (< 2^-6, reduced scale precision).
 
@@ -244,7 +245,10 @@ def _tensor_stats(prefix, layer, x, quant=False):
     _add(prefix + "/count", layer, float(x2.numel()))
     if quant:
         flat = x2.reshape(-1)
-        med = flat[::max(1, flat.numel() // _MEDIAN_SAMPLE)].abs().float().median()
+        if flat.numel() > _MEDIAN_SAMPLE:   # uniform random subsample: a fixed stride aliases
+            flat = flat[torch.randint(flat.numel(), (_MEDIAN_SAMPLE,), device=flat.device,
+                                      generator=_gen())]      # with the row length (columns)
+        med = flat.abs().float().median()
         if med > 0:
             r = tmax / med
             _add(prefix + "/mom_sum", layer, r.double())
