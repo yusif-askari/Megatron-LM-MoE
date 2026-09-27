@@ -305,6 +305,33 @@ def test_och_ratio_token_weighted_mean_and_worst():
     assert 40 < mean < 60 and 80 < worst < 120
 
 
+def _och_all(h, tpe):
+    gs.begin_step(True, num_layers=1, num_experts=len(tpe))
+    gs.set_layer(1)
+    z = torch.zeros_like(h)
+    gs.record_glu("routed", z, z, z, h, torch.nn.functional.silu, tpe)
+    sc = gs.reduce_and_log(iteration=1)
+    g = lambda k: sc[f"gate-outliers/routed/h_{k}"]
+    return (g("outlier_channel_ratio"), g("och_outlier_frac"), g("och_p90_over_median"),
+            g("och_top1pct_energy"))
+
+
+def test_och_one_extreme_channel_vs_many_loud_channels():
+    # one extreme channel, the rest uniform: ratio 10, but 1/448 outliers and a uniform bulk
+    h = torch.full((64, 448), 0.5, device=DEV); h[:, 17] = 5.0
+    r, frac, p90, top = _och_all(h, [64])
+    print(f"  one extreme channel: ratio {r:.2f} outlier_frac {frac:.4f} p90/med {p90:.2f} "
+          f"top1% energy {top:.3f}")
+    assert abs(r - 10) < 1e-4 and abs(frac - 1 / 448) < 1e-6 and abs(p90 - 1) < 1e-4
+    assert abs(top - (25 + 4 * 0.25) / (25 + 447 * 0.25)) < 1e-4       # top 5 = ceil(1% of 448)
+    # 20% of channels 3x louder: no extreme outlier, but a non-uniform bulk
+    h = torch.full((64, 448), 0.5, device=DEV); h[:, :90] = 1.5
+    r, frac, p90, top = _och_all(h, [64])
+    print(f"  20% loud channels:   ratio {r:.2f} outlier_frac {frac:.4f} p90/med {p90:.2f} "
+          f"top1% energy {top:.3f}")
+    assert abs(r - 3) < 1e-4 and frac == 0 and abs(p90 - 3) < 1e-4
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0
