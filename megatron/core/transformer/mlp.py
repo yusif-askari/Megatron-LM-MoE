@@ -314,6 +314,8 @@ class MLP(MegatronModule):
         """Perform the forward pass through the MLP block."""
         # [s, b, 4 * h/p]
         nvtx_range_push(suffix="linear_fc1")
+        if glu_stats.is_active():  # --log-glu-stats: GEMM input for error stats
+            glu_stats.stash_fc1_input(hidden_states)
         intermediate_parallel, bias_parallel = apply_module(self.linear_fc1)(hidden_states)
         nvtx_range_pop(suffix="linear_fc1")
 
@@ -507,8 +509,10 @@ class MLP(MegatronModule):
                     gate = self.config.activation_func(x_glu)
                     out = gate * (x_linear + self.config.glu_linear_offset)
                     if glu_stats.is_active():  # --log-glu-stats, logging steps only
-                        glu_stats.record_glu("shared" if type(self).__name__ == "SharedExpertMLP" else "dense", x_linear, x_glu, gate, out,
-                                             self.config.activation_func, None)
+                        site = "shared" if type(self).__name__ == "SharedExpertMLP" else "dense"
+                        glu_stats.record_glu(site, x_linear, x_glu, gate, out,
+                                             self.config.activation_func, None,
+                                             fc1_out=x, module=self)
                     return out
 
                 intermediate_parallel = glu(intermediate_parallel)
