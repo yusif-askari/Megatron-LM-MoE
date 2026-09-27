@@ -257,6 +257,18 @@ def test_gemm_skipped_when_input_mismatch():
     assert "gemm-quant/routed/fc2_fprop_nvfp4_relerr" in sc      # needs no fc1 input
 
 
+def test_median_sample_not_column_aliased():
+    # 131072 x 448 like the routed h: a stride of numel // 2**20 = 56 divides 448 and would
+    # sample only 8 columns. Make those columns tiny; the median must still see all columns.
+    gs.begin_step(True, num_layers=1)
+    x = torch.ones(131072, 448, device=DEV)
+    x[:, ::56] = 1e-3
+    gs._tensor_stats("v", 1, x, quant=True)
+    r = gs._T.sums["v/mom_sum"][1].item()
+    print(f"  max/median with 8 tiny columns: {r:.3f} (1.0 expected)")
+    assert abs(r - 1.0) < 1e-6, r
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0
