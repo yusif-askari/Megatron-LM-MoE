@@ -23,8 +23,10 @@ For a GLU  h = z1 * f(z2)  (z2 = gate input, f = the gate, h = input of fc2):
              representable / largest, the paper's Fig. 7 convention), and the
              fraction of hidden units (per expert) that are in the dead zone for
              more than 99% of their tokens.
-  outliers   outlier-channel ratio: max / median over hidden units of the
-             per-unit RMS of h (the "stripes" of per-channel heatmaps), and
+  outliers   outlier-channel ratio: per expert, max / median over its hidden units
+             of the per-unit RMS of h (the "stripes" of per-channel heatmaps);
+             token-weighted mean over experts with >= 32 tokens (and the worst
+             expert as ..._max), and
              max|x| / median|x| of h and dz2 per call (exact max; median of a uniform random
              1M-element subsample), mean and max over calls.
   nvfp4 scale fraction of NVFP4 blocks whose E4M3 block scale underflows to 0
@@ -68,6 +70,7 @@ _E2M1_MIDS = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
 # dead-zone floors on |f'(z)|: smallest representable / largest in a block
 FLOORS = {"fp8": 2.0 ** -9 / _FP8_MAX, "fp4": 0.5 / 6.0}
 _DEAD_UNIT_FRAC = 0.99
+_MIN_CH_TOKENS = 32          # experts with fewer tokens are skipped for the outlier-channel ratio
 _CHUNK = 1 << 24            # elements per chunk (bounds the fp32 temporaries)
 _LOGIT_POSITIONS = 64
 _WGT_2D = {"fp8": 128, "nvfp4": 16}   # weight blocks: DeepSeek-V3 128x128, NVFP4 16x16; MXFP4 1x32
@@ -314,12 +317,16 @@ def _unit_stats(site, layer, z2, h, gate_fn, tokens_per_expert):
     for k in FLOORS:
         is_dead = (dead[k] / cnt > _DEAD_UNIT_FRAC) & live.unsqueeze(1)
         _add(f"{site}/dead_units_{k}", layer, is_dead.sum(dtype=torch.float64))
-    rms = (hsq / cnt).sqrt()[live].flatten()
-    if rms.numel():
-        ratio = rms.max() / rms.median().clamp(min=1e-30)
-        _add(f"{site}/h/och_ratio_sum", layer, ratio.double())
-        _add(f"{site}/h/och_ratio_n", layer, 1.0)
-        _max(f"{site}/h/och_ratio_max", layer, ratio)
+    # outlier-channel ratio WITHIN each expert (channels of different experts never share a
+    # quantization block), skipping experts whose per-channel RMS rests on too few tokens.
+    elig = counts >= _MIN_CH_TOKENS
+    if elig.any():
+        rms = (hsq[elig] / cnt[elig]).sqrt()                            # [E_elig, F]
+        ratio = rms.max(1).values / rms.median(1).values.clamp(min=1e-30)
+        w = counts[elig].double()
+        _add(f"{site}/h/och_ratio_wsum", layer, (ratio.double() * w).sum())
+        _add(f"{site}/h/och_ratio_w", layer, w.sum())
+        _max(f"{site}/h/och_ratio_max", layer, ratio.max())
 
 
 def _get_weights(module, e):
@@ -586,7 +593,7 @@ def _metrics(S, M, V):
                     put(site, f"deadzone_{k}", l, dz[l] / zc[l])
                 if units is not None and units[l] > 0 and du is not None:
                     put(site, f"dead_units_{k}", l, du[l] / units[l])
-        n, sm, mx = (S.get(f"{site}/h/och_ratio_n"), S.get(f"{site}/h/och_ratio_sum"),
+        n, sm, mx = (S.get(f"{site}/h/och_ratio_w"), S.get(f"{site}/h/och_ratio_wsum"),
                      M.get(f"{site}/h/och_ratio_max"))
         for l in range(len(n or [])):
             if n[l] > 0:

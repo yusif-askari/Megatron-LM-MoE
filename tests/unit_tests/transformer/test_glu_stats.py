@@ -269,6 +269,42 @@ def test_median_sample_not_column_aliased():
     assert abs(r - 1.0) < 1e-6, r
 
 
+def _och(h, tpe, site="routed"):
+    gs.begin_step(True, num_layers=1, num_experts=len(tpe))
+    gs.set_layer(1)
+    z = torch.zeros_like(h)
+    gs.record_glu(site, z, z, z, h, torch.nn.functional.silu, tpe)
+    sc = gs.reduce_and_log(iteration=1)
+    return (sc[f"gate-outliers/{site}/h_outlier_channel_ratio"],
+            sc[f"gate-outliers/{site}/h_outlier_channel_ratio_max"])
+
+
+def test_och_ratio_ignores_scale_between_experts():
+    # caveat 1: expert B is 3x expert A everywhere, no outlier channel in either -> 1.0
+    h = torch.cat([torch.ones(64, 16, device=DEV), 3 * torch.ones(64, 16, device=DEV)])
+    mean, worst = _och(h, [64, 64])
+    print(f"  scale difference between experts: ratio {mean:.3f} (pooled would give 1.5)")
+    assert abs(mean - 1.0) < 1e-6 and abs(worst - 1.0) < 1e-6
+
+
+def test_och_ratio_skips_low_token_experts():
+    # caveat 2: pure noise; a 1-token expert would give ~4-5 by chance and must be skipped
+    torch.manual_seed(5)
+    h = torch.randn(1001, 448, device=DEV)
+    mean, worst = _och(h, [1000, 1])
+    print(f"  noise, 1000-token + 1-token expert: ratio {mean:.3f} (1-token expert skipped)")
+    assert mean < 1.25 and worst < 1.25
+
+
+def test_och_ratio_token_weighted_mean_and_worst():
+    torch.manual_seed(6)
+    h = torch.randn(1024, 128, device=DEV)
+    h[:512, 3] *= 100.0                       # outlier channel only in expert 0
+    mean, worst = _och(h, [512, 512])
+    print(f"  x100 channel in 1 of 2 equal experts: mean {mean:.1f} worst {worst:.1f}")
+    assert 40 < mean < 60 and 80 < worst < 120
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0
