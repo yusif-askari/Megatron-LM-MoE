@@ -288,6 +288,13 @@ class MLP(MegatronModule):
             self.xr2glu = XR2GLU(num_local_experts=1, config=self.config)
         if self.config.xssglu:
             self.xssglu_glu = XSSGLU(num_local_experts=1, config=self.config)
+        # --exp-gate exp_pglu / exp_xrlglu: a single coefficient set per MLP.
+        if self.config.exp_learnable_gate is not None:
+            from megatron.core.exp_gates import LEARNABLE_GATES
+
+            self.exp_gate = LEARNABLE_GATES[self.config.exp_learnable_gate](
+                config=self.config, num_local_experts=1
+            )
         if self.config.polynorm:
             self.polynorm_act = PolyNormAct(
                 num_local_experts=1, config=self.config, tp_group=self.tp_group
@@ -506,12 +513,14 @@ class MLP(MegatronModule):
                     if (val := self.config.activation_func_clamp_value) is not None:
                         x_glu = x_glu.clamp(min=None, max=val)
                         x_linear = x_linear.clamp(min=-val, max=val)
-                    gate = self.config.activation_func(x_glu)
+                    gate_fn = (self.exp_gate if self.config.exp_learnable_gate is not None
+                               else self.config.activation_func)
+                    gate = gate_fn(x_glu)
                     out = gate * (x_linear + self.config.glu_linear_offset)
                     if glu_stats.is_active():  # --log-glu-stats, logging steps only
                         site = "shared" if type(self).__name__ == "SharedExpertMLP" else "dense"
                         glu_stats.record_glu(site, x_linear, x_glu, gate, out,
-                                             self.config.activation_func, None,
+                                             gate_fn, None,
                                              fc1_out=x, module=self)
                     return out
 

@@ -105,30 +105,87 @@ def exp_arglu(x):
 
 
 # ---- learnable gates ---------------------------------------------------------
+# One coefficient set per local expert (num_local_experts=1 for dense / shared MLPs, and for
+# standalone use). forward(x, tokens_per_expert) maps each expert's coefficients onto its rows
+# of the expert-concatenated [N, F] input; forward(x, expert_ids=ids) does the same from
+# explicit row ids (used by --log-glu-stats). Math runs in (at least) fp32, output in x.dtype.
+def _exprel(z):
+    """(e^z - 1)/z with its Taylor series near 0, so value and d/dz stay finite at z = 0."""
+    small = z.abs() < 1e-3
+    zs = torch.where(small, torch.ones_like(z), z)
+    return torch.where(small, 1.0 + z * (0.5 + z * (1.0 / 6.0 + z / 24.0)), torch.expm1(zs) / zs)
+
 def _bump_integral(u, p):
-    s = 1.0 + u.abs()
-    g = torch.where((p - 1.0).abs() < 1e-4, torch.log(s), (torch.pow(s, 1.0 - p) - 1.0) / (1.0 - p))
-    return torch.sign(u) * g
+    """F_p(u) = sign(u) ((1+|u|)^(1-p) - 1)/(1-p)  (sign(u) ln(1+|u|) at p = 1), written as
+    sign(u) l exprel((1-p) l) with l = ln(1+|u|): smooth in p, so dF/dp is exact at p = 1."""
+    l = torch.log1p(u.abs())
+    return torch.sign(u) * l * _exprel((1.0 - p) * l)
 
-class ExpPGLU(MegatronModule):
-    """Learnable tail exponent p (>0) and shift b: g'(x)=1/(1+|x-b|)^p, integrated, g(0)=0."""
-    def __init__(self, config=None, p_init=1.0, b_init=1.0, dtype=torch.float32):
-        super().__init__(config=config)
-        self.raw_p = nn.Parameter(torch.log(torch.expm1(torch.tensor(p_init, dtype=dtype))))
-        self.b = nn.Parameter(torch.tensor(b_init, dtype=dtype))
-    def forward(self, x):
-        p = F.softplus(self.raw_p)
-        return _bump_integral(x - self.b, p) - _bump_integral(-self.b, p)
+@jit_fuser
+def _pglu(x, p, b):
+    xf = x.to(p.dtype)
+    return (_bump_integral(xf - b, p) - _bump_integral(-b, p)).to(x.dtype)
 
-class ExpXRLGLU(MegatronModule):
-    """Learnable negative-dip depth alpha (expanded-range trick on RLGLU): g' stretched
-    from (0,1) to (-alpha,1). g(0)=0."""
-    def __init__(self, config=None, alpha_init=0.3, dtype=torch.float32):
+@jit_fuser
+def _xrlglu(x, a):
+    xf = x.to(a.dtype)
+    return ((1.0 + a) * (F.relu(xf) - 0.5 * torch.log1p(xf.abs())) - a * xf).to(x.dtype)
+
+class _PerExpertGate(MegatronModule):
+    per_expert_gate = True                            # glu_stats: call with expert_ids=
+
+    def __init__(self, config=None, num_local_experts=1):
         super().__init__(config=config)
-        self.alpha = nn.Parameter(torch.tensor(alpha_init, dtype=dtype))
-    def forward(self, x):
-        a = self.alpha
-        return (1.0 + a) * (F.relu(x) - 0.5 * torch.log1p(x.abs())) - a * x
+        self.num_local_experts = num_local_experts
+        # routed experts under EP: each rank owns different experts, so the coefficient
+        # grads must reduce over the expert-data-parallel group, like the expert weights.
+        self._expert_parallel = (num_local_experts > 1 and config is not None
+                                 and getattr(config, "expert_model_parallel_size", 1) > 1)
+
+    def _param(self, value):
+        t = nn.Parameter(torch.full((self.num_local_experts,), float(value)))
+        if self._expert_parallel:
+            t.allreduce = False
+        return t
+
+    def _rows(self, t, x, tokens_per_expert=None, expert_ids=None):
+        """(E,) coefficient -> tensor broadcastable against x ([N, F] -> [N, 1])."""
+        t = t.to(torch.promote_types(x.dtype, torch.float32))
+        if expert_ids is not None:
+            return t[expert_ids].unsqueeze(-1)
+        if self.num_local_experts == 1:
+            return t
+        if tokens_per_expert is None:
+            raise ValueError(f"{type(self).__name__} with {self.num_local_experts} local experts "
+                             "needs tokens_per_expert")
+        n = x.shape[0]
+        counts = torch.as_tensor(tokens_per_expert, device=x.device)
+        return torch.repeat_interleave(t, counts, output_size=n).unsqueeze(-1)
+
+class ExpPGLU(_PerExpertGate):
+    """Learnable tail exponent p = softplus(rho) > 0 and shift b (per expert):
+    g'(x) = 1/(1+|x-b|)^p, g(x) = F_p(x-b) - F_p(-b), g(0) = 0. The default init (p=1, b=1)
+    is exactly exp_l0m1r0_p1_b1."""
+    def __init__(self, config=None, p_init=1.0, b_init=1.0, num_local_experts=1):
+        super().__init__(config, num_local_experts)
+        self.raw_p = self._param(torch.log(torch.expm1(torch.tensor(float(p_init)))).item())
+        self.b = self._param(b_init)
+    def coefficients(self):
+        return {"p": F.softplus(self.raw_p.float()), "b": self.b.float()}
+    def forward(self, x, tokens_per_expert=None, expert_ids=None):
+        p = F.softplus(self._rows(self.raw_p, x, tokens_per_expert, expert_ids))
+        return _pglu(x, p, self._rows(self.b, x, tokens_per_expert, expert_ids))
+
+class ExpXRLGLU(_PerExpertGate):
+    """Learnable negative-dip depth alpha (expanded-range trick on RLGLU), per expert: g'
+    stretched from (0,1) to (-alpha,1). g(0) = 0; alpha = 0 is exp_l0m0.5r1_p1_b0 (RLGLU)."""
+    def __init__(self, config=None, alpha_init=0.3, num_local_experts=1):
+        super().__init__(config, num_local_experts)
+        self.alpha = self._param(alpha_init)
+    def coefficients(self):
+        return {"alpha": self.alpha.float()}
+    def forward(self, x, tokens_per_expert=None, expert_ids=None):
+        return _xrlglu(x, self._rows(self.alpha, x, tokens_per_expert, expert_ids))
 
 
 # ---- baselines ---------------------------------------------------------------
@@ -142,7 +199,8 @@ def exp_ssglu(x):  return x * (0.5 + 0.5 * F.softsign(x))
 
 # ---- master registry: name -> callable (or class) ----------------------------
 GATES = {name: fn for name, (fn, _) in BUILDER_GATES.items()}
-GATES.update(exp_arglu=exp_arglu, exp_pglu=ExpPGLU, exp_xrlglu=ExpXRLGLU,
+LEARNABLE_GATES = {"exp_pglu": ExpPGLU, "exp_xrlglu": ExpXRLGLU}
+GATES.update(exp_arglu=exp_arglu, **LEARNABLE_GATES,
              exp_swiglu=exp_swiglu, exp_situ=exp_situ, exp_ssglu=exp_ssglu)
 
 

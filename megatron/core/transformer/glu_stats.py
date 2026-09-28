@@ -308,7 +308,9 @@ def _unit_stats(site, layer, z2, h, gate_fn, tokens_per_expert):
         ec = eid[s:s + rows]
         with torch.enable_grad():
             zg = z2d[s:s + rows].float().requires_grad_(True)
-            (gp,) = torch.autograd.grad(gate_fn(zg).sum(), zg)
+            gv = gate_fn(zg, expert_ids=ec) if getattr(gate_fn, "per_expert_gate", False) \
+                else gate_fn(zg)
+            (gp,) = torch.autograd.grad(gv.sum(), zg)
         agp = gp.abs()
         for k, fl in FLOORS.items():
             m = (agp < fl).float()
@@ -460,6 +462,25 @@ def _bwd_gemm_hook(site, layer, rows, xin, w1, grad):
             _gemm_err(f"{site}/gemm/fc1_wgrad_{name}", layer, ref, approx)
 
 
+def _gate_params(site, layer, gate_mod, owner):
+    """Learned gate coefficients (one per local expert), placed at their global expert index so
+    the SUM-reduce yields every expert's value once per replica: mean / std / min / max."""
+    E_loc = gate_mod.num_local_experts
+    off = 0
+    if site == "routed" and getattr(owner, "ep_group", None) is not None:
+        off = owner.ep_group.rank() * E_loc
+    E = max(_T.num_experts, off + E_loc)
+    if E > _T.num_experts:                  # dense / shared MLP before begin_step knew experts
+        return
+    for name, v in gate_mod.coefficients().items():
+        buf = torch.zeros(E, dtype=torch.float64, device=v.device)
+        cnt = torch.zeros_like(buf)
+        buf[off:off + E_loc] = v.detach().double().flatten()
+        cnt[off:off + E_loc] = 1.0
+        _vec(f"{site}/param/{name}/sum", layer, buf)
+        _vec(f"{site}/param/{name}/n", layer, cnt)
+
+
 def _grad_hook(site, name, layer, grad):
     if _T.active and grad is not None:
         with torch.no_grad():
@@ -489,6 +510,8 @@ def record_glu(site, z1, z2, gate, h, gate_fn, tokens_per_expert=None, fc1_out=N
         _unit_stats(site, layer, z2, h, gate_fn, tokens_per_expert)
         if (site, layer) not in _T.done:
             _T.done.add((site, layer))
+            if getattr(gate_fn, "per_expert_gate", False):
+                _gate_params(site, layer, gate_fn, module)
             _deep_stats(site, layer, z1, z2, h, fc1_out, fc1_in, module, tokens_per_expert)
     if z2.requires_grad:
         z2.register_hook(lambda g, s=site, l=layer: _grad_hook(s, "dz2", l, g))
@@ -641,6 +664,20 @@ def _metrics(S, M, V):
                             put(site, f"{base}_max", l, mk[l])
                 elif rest == "gemm/skipped" and S[key][l] > 0:
                     put(site, "gemm/skipped_samples", l, S[key][l])
+        for key in V:                       # learned gate coefficients (exp_pglu / exp_xrlglu)
+            if not (key.startswith(site + "/param/") and key.endswith("/sum")):
+                continue
+            name = key[len(site) + 7:-4]
+            for l, (vs, ns) in enumerate(zip(V[key], V[key[:-4] + "/n"])):
+                vals = [v / n for v, n in zip(vs, ns) if n > 0]
+                if not vals:
+                    continue
+                mean = sum(vals) / len(vals)
+                put(site, f"param/{name}_mean", l, mean)
+                put(site, f"param/{name}_std", l,
+                    math.sqrt(sum((v - mean) ** 2 for v in vals) / len(vals)))
+                put(site, f"param/{name}_min", l, min(vals))
+                put(site, f"param/{name}_max", l, max(vals))
     moments("resid", "x", "resid")
     moments("logits", "x", "logits")
     for l, vec in enumerate(V.get("router/tokens_per_expert", [])):
@@ -670,7 +707,8 @@ _PER_LAYER = {
     "align/w_cos_abs_mean", "align/z_corr_abs_mean", "h/och_outlier_frac",
     "h/och_p90_over_median", "h/och_top1pct_energy",
 }
-_PREFIX_SECTION = {"gemm/": "gemm-quant", "wq/": "weight-quant", "align/": "gate-align"}
+_PREFIX_SECTION = {"gemm/": "gemm-quant", "wq/": "weight-quant", "align/": "gate-align",
+                   "param/": "learned-gate"}
 
 
 def _tag(site, metric):
@@ -703,13 +741,19 @@ def reduce_and_log(iteration, writer=None, wandb_writer=None):
     for (site, metric), per_slot in metrics.items():
         section, leaf = _tag(site, metric)
         # dense MLPs and the LM head occupy a single slot: their average is already per-layer
-        if metric in _PER_LAYER and site not in ("dense", "logits"):
+        per_layer = metric in _PER_LAYER or (metric.startswith("param/") and (
+            metric.endswith("_mean") or (site == "routed" and metric.endswith(("_min", "_max")))))
+        if per_layer and site not in ("dense", "logits"):
             for slot, val in per_slot.items():
                 if slot > 0:
                     scalars[f"layers-{section}/{leaf}/L{slot:02d}"] = val
         vals = list(per_slot.values())
-        agg = max(vals) if any(metric.endswith(s) or s in metric for s in _MAX_LIKE) \
-            else sum(vals) / len(vals)
+        if metric.startswith("param/") and metric.endswith("_min"):
+            agg = min(vals)
+        elif any(metric.endswith(s) or s in metric for s in _MAX_LIKE):
+            agg = max(vals)
+        else:
+            agg = sum(vals) / len(vals)
         scalars[f"{section}/{leaf}"] = agg
     if writer is not None:
         for tag, val in scalars.items():
