@@ -299,6 +299,14 @@ class TEGroupedMLP(MegatronModule):
             self.xssglu_glu = XSSGLU(
                 num_local_experts=self.num_local_experts, config=self.config
             )
+        # --exp-gate exp_pglu / exp_xrlglu: one coefficient set per local expert, mapped onto
+        # the concatenated tokens via tokens_per_expert inside the generic GLU path below.
+        if self.config.exp_learnable_gate is not None:
+            from megatron.core.exp_gates import LEARNABLE_GATES
+
+            self.exp_gate = LEARNABLE_GATES[self.config.exp_learnable_gate](
+                config=self.config, num_local_experts=self.num_local_experts
+            )
         if self.config.polynorm:
             self.polynorm_act = PolyNormAct(
                 num_local_experts=self.num_local_experts,
@@ -558,11 +566,16 @@ class TEGroupedMLP(MegatronModule):
                     if (val := self.config.activation_func_clamp_value) is not None:
                         x_glu = x_glu.clamp(min=None, max=val)
                         x_linear = x_linear.clamp(min=-val, max=val)
-                    gate = self.config.activation_func(x_glu)
+                    if self.config.exp_learnable_gate is not None:
+                        gate_fn = self.exp_gate
+                        gate = gate_fn(x_glu, tokens_per_expert)
+                    else:
+                        gate_fn = self.config.activation_func
+                        gate = gate_fn(x_glu)
                     out = gate * (x_linear + self.config.glu_linear_offset)
                     if glu_stats.is_active():  # --log-glu-stats, logging steps only
                         glu_stats.record_glu("routed", x_linear, x_glu, gate, out,
-                                             self.config.activation_func, tokens_per_expert,
+                                             gate_fn, tokens_per_expert,
                                              fc1_out=x, module=self)
                     return out
 
@@ -625,6 +638,7 @@ class TEGroupedMLP(MegatronModule):
                 or self.config.xr2glu
                 or self.config.xssglu
                 or self.config.polynorm
+                or self.config.exp_learnable_gate is not None
             ):
                 # These all have the same per-expert-coefficient repeat_interleave gradient
                 # exposure as PolyNorm (see the docstring below) -- zero their padding rows too.
@@ -713,7 +727,7 @@ class TEGroupedMLP(MegatronModule):
             module_sharded_offsets = sharded_offsets
             if name in (
                 'polynorm_glu', 'xpr_act', 'gxpr_glu', 'gxpry_glu', 'gxprv2_glu', 'xr2_act',
-                'gxr2_glu', 'xr2glu', 'xssglu_glu', 'polynorm_act',
+                'gxr2_glu', 'xr2glu', 'xssglu_glu', 'polynorm_act', 'exp_gate',
             ) and not singleton_local_shards:
                 # The PolyNorm/XPR/GXPR/XR2/GXR2/XR2GLU/XSSGLU/PolyNormAct coefficients are stored as a single
                 # (num_local_experts,) tensor. Prepend an expert-parallel sharding axis so this rank's coefficients

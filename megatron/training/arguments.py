@@ -1942,15 +1942,19 @@ def core_transformer_config_from_args(args, config_class=None):
         kw_args['bias_activation_fusion'] = False
     elif getattr(args, 'exp_gate', None) is not None:
         # Activation-sweep gates (megatron/core/exp_gates.py). --exp-gate NAME picks any of the
-        # builder gates (exp_l{L}m{M}r{R}_p{power}_b{shift}) or exp_arglu / baselines. Non-learnable
-        # elementwise gate -> generic (non-fused) GLU path, exactly like --lglu / --situ.
+        # builder gates (exp_l{L}m{M}r{R}_p{power}_b{shift}), exp_arglu / baselines, or a learnable
+        # gate (exp_pglu / exp_xrlglu). Elementwise gate -> generic (non-fused) GLU path, exactly
+        # like --lglu / --situ. A learnable gate is a module with per-expert coefficients built by
+        # MLP / TEGroupedMLP from config.exp_learnable_gate; activation_func stays a SiLU
+        # placeholder for the unused code paths.
         assert not args.swiglu
         fn = EXP_GATES[args.exp_gate]
-        assert not isinstance(fn, type), (
-            f"--exp-gate {args.exp_gate} is a learnable gate; not yet wired for MoE per-expert "
-            f"params. Use a fixed builder gate (exp_l..._p..._b0) instead.")
         kw_args['gated_linear_unit'] = True
-        kw_args['activation_func'] = fn
+        if isinstance(fn, type):
+            kw_args['exp_learnable_gate'] = args.exp_gate
+            kw_args['activation_func'] = F.silu
+        else:
+            kw_args['activation_func'] = fn
         kw_args['bias_activation_fusion'] = False
     if args.pnglu:
         # PolyNorm GLU replaces the gate of a gated linear unit; it is itself a (learnable)
@@ -2379,6 +2383,7 @@ def _add_network_size_args(parser):
         "gxr2",
         "xr2glu",
         "xssglu",
+        "exp_learnable_gate",
         "pn3glu",
         "polynorm",
         "sandwich_norm",
@@ -2492,8 +2497,9 @@ def _add_network_size_args(parser):
                        help='Iterations between --log-glu-stats logging steps.')
     group.add_argument('--exp-gate', type=str, default=None,
                        help='Activation-sweep gate by name from megatron/core/exp_gates.py, e.g. '
-                       'exp_l0m1r0_p0.5_b1 (rsqrt bump) or exp_arglu. Non-learnable; implies gated '
-                       'linear units, runs through the generic GLU path (like --lglu / --situ).')
+                       'exp_l0m1r0_p0.5_b1 (rsqrt bump), exp_arglu, or the learnable exp_pglu / '
+                       'exp_xrlglu (per-expert coefficients). Implies gated linear units, runs '
+                       'through the generic GLU path (like --lglu / --situ).')
     group.add_argument('--pnglu', action='store_true',
                        help='Replace the SiLU gate of SwiGLU with a learnable 2nd-order '
                        'PolyNorm: gate(x) = |a1|*RMSNorm(x) + |a2|*RMSNorm(x**2). '

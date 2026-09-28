@@ -300,6 +300,12 @@ class TransformerConfig(ModelParallelConfig):
     yet. Not compatible with ``bias_activation_fusion``, ``use_te_activation_func``, or the
     offloading-experts path."""
 
+    exp_learnable_gate: Optional[str] = None
+    """Name of a learnable activation-sweep gate from megatron/core/exp_gates.py
+    (``exp_pglu`` / ``exp_xrlglu``), set by ``--exp-gate``. The gate g(x_glu) * x_linear runs in
+    the generic GLU path with one coefficient set per local expert (one per dense / shared MLP).
+    Requires ``gated_linear_unit=True`` and no ``bias_activation_fusion``."""
+
     xssglu: bool = False
     """If True, replace the gate of a gated linear unit with the learnable XSSGLU gate:
     ``XSSGLU(x_glu, x_linear) = (|alpha|*softsign(x_glu) + 0.5) * x_glu * x_linear``. Unlike
@@ -1690,6 +1696,14 @@ class TransformerConfig(ModelParallelConfig):
             # all-reduces the feature statistics and the alpha gradients across the relevant
             # tensor-parallel group, so it is correct (and consistent) at any TP/ETP degree. No
             # parallelism restriction is needed.
+
+        if self.exp_learnable_gate is not None:
+            if not self.gated_linear_unit or self.bias_activation_fusion or \
+                    self.use_te_activation_func:
+                raise ValueError(
+                    f"exp_learnable_gate={self.exp_learnable_gate} needs gated_linear_unit=True, "
+                    "bias_activation_fusion=False and use_te_activation_func=False."
+                )
 
         # These are all recently-added, not-yet-fused learnable activations sharing the same
         # (narrow) compatibility envelope; they are mutually exclusive with each other.
