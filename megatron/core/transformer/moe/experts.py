@@ -236,6 +236,8 @@ class TEGroupedMLP(MegatronModule):
 
         self.ep_group = pg_collection.ep
         self.tp_group = pg_collection.expt_tp
+        # expert-data-parallel group: sets the replica_id of the per-expert gate coefficients
+        self.expt_dp_group = getattr(pg_collection, 'expt_dp', None)
 
         # Double the output width with gated linear unit, see https://arxiv.org/pdf/2002.05202.pdf
         ffn_hidden_size = not_none(self.config.moe_ffn_hidden_size)
@@ -744,6 +746,14 @@ class TEGroupedMLP(MegatronModule):
             sub_sd = sharded_state_dict_default(
                 module, f'{name}.', module_sharded_offsets, metadata, tp_group=self.tp_group
             )
+            if module_sharded_offsets is not sharded_offsets and self.expt_dp_group is not None:
+                # The default replica_id uses the full data-parallel rank, but EP is carved out
+                # of DP: EP ranks > 0 would count as replicas and their coefficient shard would
+                # never be written. Replicas of an expert differ only in the expert-DP rank
+                # (as in SequentialMLP.sharded_state_dict).
+                for sh_ten in sub_sd.values():
+                    if hasattr(sh_ten, 'replica_id') and len(sh_ten.replica_id) == 3:
+                        sh_ten.replica_id = (*sh_ten.replica_id[:2], self.expt_dp_group.rank())
             if name == 'linear_fc1' and self.config.gated_linear_unit:
                 num_global_experts = self.ep_group.size() * self.num_local_experts
                 local_expert_indices_offset = self.ep_group.rank() * self.num_local_experts
