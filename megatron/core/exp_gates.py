@@ -76,23 +76,30 @@ def _f(v):                                                       # format, avoid
 
 def _tail(end, M, p):
     if end != 0.0: return "const"
-    return "1/x^2" if M == 0 else {0.5: "1/sqrt", 1.0: "1/x", 2.0: "1/x^2"}[p]
+    return "1/x^2" if M == 0 else {0.5: "1/sqrt", 1.0: "1/x", 1.5: "1/x^1.5", 2.0: "1/x^2"}[p]
 
 def _growth(L, R, p):
     if L != 0.0 or R != 0.0: return "linear"                     # a nonzero tail -> linear output
-    return {0.5: "sqrt", 1.0: "log", 2.0: "bounded"}[p]
+    return {0.5: "sqrt", 1.0: "log", 1.5: "bounded", 2.0: "bounded"}[p]
 
 # each entry: name -> (callable, (L, M, R, p, b))
 BUILDER_GATES = {}
+
+def _register(L, M, R, p, b):
+    name = f"exp_l{_f(L)}m{_f(M)}r{_f(R)}_p{_f(p)}_b{int(b)}"
+    BUILDER_GATES[name] = ((lambda x, L=L, M=M, R=R, p=p, b=b: _builder_gate(x, L, M, R, p, b)),
+                           (L, M, R, p, b))
+
 for (L, M, R) in _shapes():
     zeros = (L == 0.0) + (R == 0.0)
     powers = _POWERS if zeros >= 1 else [1.0]                    # power only where a tail decays
     shifts = [0.0, 1.0] if zeros == 2 else [0.0]                 # shift only the bounded bump
     for p in powers:
         for b in shifts:
-            name = f"exp_l{_f(L)}m{_f(M)}r{_f(R)}_p{_f(p)}_b{int(b)}"
-            BUILDER_GATES[name] = ((lambda x, L=L, M=M, R=R, p=p, b=b: _builder_gate(x, L, M, R, p, b)),
-                                   (L, M, R, p, b))
+            _register(L, M, R, p, b)
+
+# off-grid powers added as sweep follow-ups (the {1/2, 1, 2} grid above stays the catalogue)
+_register(0.0, 1.0, 0.0, 1.5, 0.0)       # bump p=3/2: g -> +-2 (bounded); FP4 dead zone |x| > 4.24
 
 
 # ---- structural extension (outside the single-power builder) ------------------
