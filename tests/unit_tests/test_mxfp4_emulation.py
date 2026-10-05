@@ -136,3 +136,45 @@ def test_speed_vs_te_grouped_linear():
     t_mx = bench(lambda: mx.grouped_linear(x, m_splits, ws, "alto"))
     print(f"\nfc1 fwd+bwd, {sum(m_splits)} tokens: TE bf16 {t_te:.2f} ms, emulated MXFP4 {t_mx:.2f} ms "
           f"({t_mx / t_te:.2f}x)")
+
+
+@pytest.mark.parametrize("rule", ["floor", "alto"])
+def test_dense_linear_ragged_out_dim(rule):
+    """KDA in_proj-like: N = 4106 is not a multiple of 32 (ragged last block in dgrad)."""
+    torch.manual_seed(4)
+    T, K, N = 256, 1280, 4106
+    x = torch.randn(4, T // 4, K, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    w = (torch.randn(N, K, device="cuda") / 36).to(torch.bfloat16).requires_grad_()
+    y = mx.linear(x, w, rule)
+    assert y.shape == (4, T // 4, N)
+    dy = torch.randn_like(y)
+    y.backward(dy)
+    x2, dy2 = x.detach().reshape(T, K), dy.reshape(T, N)
+    pad = (-N) % 32
+    dyp = torch.nn.functional.pad(dy2, (0, pad))
+    wp = torch.nn.functional.pad(w.detach().t(), (0, pad)).t()           # [N+pad, K]
+    y_ref = mx.qdq(x2, rule).float() @ mx.qdq(w.detach(), rule, 1).float().t()
+    dx_ref = (mx.qdq(dyp, rule).float() @ mx.qdq(wp, rule, 0).float())
+    dw_ref = mx.qdq(dy2, rule, 0).float().t() @ mx.qdq(x2, rule, 0).float()
+    rel = lambda a, b: float((a.float() - b).norm() / b.norm())
+    assert rel(y.reshape(T, N), y_ref) < 1e-2
+    assert rel(x.grad.reshape(T, K), dx_ref) < 1e-2
+    assert rel(w.grad, dw_ref) < 1e-2
+    # the padded quantization equals quantizing a zero-extended tensor and slicing
+    assert torch.equal(mx.qdq(dy2, rule), mx.qdq(dyp, rule)[:, :N])
+
+
+def test_fused_norm_matches_te():
+    """_fused_norm reproduces TE LayerNormLinear's own normalized input."""
+    te = pytest.importorskip("transformer_engine.pytorch")
+    torch.manual_seed(5)
+    for zc in (False, True):
+        mod = te.LayerNormLinear(1280, 512, bias=False, normalization="RMSNorm", eps=1e-5,
+                                 zero_centered_gamma=zc, return_layernorm_output=True,
+                                 params_dtype=torch.bfloat16, device="cuda")
+        with torch.no_grad():
+            mod.layer_norm_weight.copy_(torch.rand(1280, device="cuda") * 0.5 + (0 if zc else 0.75))
+        x = torch.randn(64, 1280, device="cuda", dtype=torch.bfloat16)
+        _, ln_out = mod(x)
+        ours = mx._fused_norm(mod, x)
+        assert float((ours.float() - ln_out.float()).abs().max()) <= 2 ** -6 * float(ln_out.abs().max())

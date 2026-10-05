@@ -1475,6 +1475,18 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     if not isinstance(model, list):
         model = [model]
 
+    # --mxfp4-emulate all_linear: every TE linear in the decoder runs as an emulated MXFP4 GEMM
+    # (the routed experts are handled inside TEGroupedMLP for both scopes).
+    if getattr(args, 'mxfp4_emulate', None) == 'all_linear':
+        from megatron.core import mxfp4_emulation
+
+        for model_module in model:
+            patched = mxfp4_emulation.apply_to_model(model_module, args.mxfp4_scale_rule)
+        print_rank_0(
+            f'> --mxfp4-emulate all_linear ({args.mxfp4_scale_rule}): {len(patched)} TE linear '
+            f'modules + the routed experts run in emulated MXFP4: {", ".join(patched)}'
+        )
+
     # Set tensor model parallel attributes if not set.
     # Only parameters that are already tensor model parallel have these
     # attributes set for them. We should make sure the default attributes

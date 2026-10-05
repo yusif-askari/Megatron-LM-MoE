@@ -300,12 +300,14 @@ class TransformerConfig(ModelParallelConfig):
     yet. Not compatible with ``bias_activation_fusion``, ``use_te_activation_func``, or the
     offloading-experts path."""
 
-    mxfp4_emulate: Optional[Literal['experts']] = None
+    mxfp4_emulate: Optional[Literal['experts', 'all_linear']] = None
     """Emulate MXFP4 GEMMs on hardware without FP4 tensor cores (megatron/core/mxfp4_emulation.py):
     every operand is quantized to MXFP4 (blocks of 32 along the GEMM's contraction dim, e8m0
     scale, e2m1 elements, round-to-nearest-even) and the product is a bf16 GEMM. ``'experts'``:
-    the routed experts' fc1 and fc2 (forward, dgrad and wgrad). Needs TEGroupedMLP, expert TP 1,
-    bias-free experts and no --fp8-format / --fp4-format."""
+    the routed experts' fc1 and fc2 (forward, dgrad and wgrad). ``'all_linear'``: also every
+    other TE linear inside the decoder (attention / KDA projections, dense and shared MLPs, MoE
+    latent projections); embedding, output layer and router stay bf16. Needs TEGroupedMLP,
+    TP 1, expert TP 1, bias-free linears and no --fp8-format / --fp4-format."""
 
     mxfp4_scale_rule: Literal['floor', 'alto'] = 'alto'
     """Block-scale rule of --mxfp4-emulate. ``'floor'``: OCP spec, e = floor(log2 amax) - 2 (the
@@ -1716,6 +1718,8 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError("--mxfp4-emulate supports bias-free experts only")
             if (self.expert_tensor_parallel_size or 1) != 1:
                 raise ValueError("--mxfp4-emulate needs --expert-tensor-parallel-size 1")
+            if self.mxfp4_emulate == 'all_linear' and self.tensor_model_parallel_size != 1:
+                raise ValueError("--mxfp4-emulate all_linear needs --tensor-model-parallel-size 1")
             if self.moe_ffn_hidden_size is not None and self.moe_ffn_hidden_size % 32:
                 raise ValueError("--mxfp4-emulate needs moe_ffn_hidden_size % 32 == 0")
         if self.exp_learnable_gate is not None:
