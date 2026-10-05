@@ -13,6 +13,13 @@ Every GEMM quantizes along its own contraction dim, as on hardware (and as in AL
     wgrad  dW = dyᵀ · x   dy and x along the tokens of each expert (each expert's segment
                           zero-padded to a multiple of 32, as an aligned grouped GEMM would)
 
+Scopes (``--mxfp4-emulate``):
+    experts     the routed experts' fc1/fc2 (TEGroupedMLP)
+    all_linear  every TE linear inside the decoder blocks as well: attention / KDA projections,
+                dense and shared-expert MLPs, MoE latent projections, with their fused input
+                norm computed in fp32 first. Embedding, output layer and router stay bf16 (they
+                are not TE linears), as do norms, softmax and attention / KDA internals.
+
 Scale rules (``--mxfp4-scale-rule``):
     floor  OCP spec / tensorcast default: e = floor(log2 amax) - 2. The block max lands in
            [4, 8)·s and is clipped to 6·s whenever it is above 6·s (~42% of blocks).
@@ -75,12 +82,15 @@ def qdq(x: torch.Tensor, rule: str, dim: int = -1) -> torch.Tensor:
         except Exception:  # noqa: BLE001  (no inductor: fall back to eager)
             _qdq_compiled = _qdq_lastdim
     dim = dim % x.ndim
-    if x.shape[dim] % BLOCK:
-        raise ValueError(f"MXFP4 contraction dim {x.shape[dim]} is not a multiple of {BLOCK}")
-    if dim == x.ndim - 1:
-        return _qdq_compiled(x.contiguous(), rule)
-    xt = x.transpose(dim, -1).contiguous()
-    return _qdq_compiled(xt, rule).transpose(dim, -1)
+    xt = x if dim == x.ndim - 1 else x.transpose(dim, -1)
+    n = xt.shape[-1]
+    pad = (-n) % BLOCK
+    if pad:  # ragged last block: zero padding never raises the block max (hardware pads too)
+        xt = torch.nn.functional.pad(xt, (0, pad))
+    q = _qdq_compiled(xt.contiguous(), rule)
+    if pad:
+        q = q[..., :n]
+    return q if dim == x.ndim - 1 else q.transpose(dim, -1)
 
 
 def _offsets(counts, device):
@@ -163,3 +173,82 @@ def te_grouped_linear_forward(module, x: torch.Tensor, m_splits, rule: str):
     assert getattr(module, "use_bias", False) is False, "MXFP4 emulation supports bias-free experts"
     weights = [getattr(module, f"weight{i}") for i in range(module.num_gemms)]
     return grouped_linear(x, m_splits, weights, rule), None
+
+
+class _MXFP4Linear(torch.autograd.Function):
+    """y = Q(x) · Q(W)ᵀ for x [T, K], W [N, K] (no bias)."""
+
+    @staticmethod
+    def forward(ctx, x, w, rule):
+        ctx.rule = rule
+        ctx.save_for_backward(x, w)
+        return qdq(x, rule, dim=-1) @ qdq(w, rule, dim=1).t()
+
+    @staticmethod
+    def backward(ctx, dy):
+        x, w = ctx.saved_tensors
+        rule = ctx.rule
+        dy = dy.contiguous()
+        dx = qdq(dy, rule, dim=-1) @ qdq(w, rule, dim=0) if ctx.needs_input_grad[0] else None
+        dw = qdq(dy, rule, dim=0).t() @ qdq(x, rule, dim=0)                 # along tokens
+        if hasattr(w, "main_grad") and getattr(w, "grad_added_to_main_grad", None) is not None:
+            w.main_grad.add_(dw.float())
+            w.grad_added_to_main_grad = True
+            return dx, _dummy_grad(w), None
+        return dx, dw.to(w.dtype), None
+
+
+def linear(x: torch.Tensor, w: torch.Tensor, rule: str) -> torch.Tensor:
+    """Emulated-MXFP4 x · Wᵀ over the last dim of x (any leading shape)."""
+    lead = x.shape[:-1]
+    y = _MXFP4Linear.apply(x.reshape(-1, x.shape[-1]), w, rule)
+    return y.reshape(*lead, w.shape[0])
+
+
+def _fused_norm(module, x):
+    """The input norm of a TE LayerNormLinear, in fp32 (same parameters as the fused kernel)."""
+    xf = x.float()
+    gamma = module.layer_norm_weight.float()
+    if getattr(module, "zero_centered_gamma", False):
+        gamma = gamma + 1.0
+    if module.normalization == "RMSNorm":
+        y = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + module.eps) * gamma
+    else:
+        y = torch.nn.functional.layer_norm(xf, xf.shape[-1:], None, None, module.eps) * gamma
+        if getattr(module, "layer_norm_bias", None) is not None:
+            y = y + module.layer_norm_bias.float()
+    return y.to(x.dtype)
+
+
+def _te_linear_forward(module, x, rule, fused_norm):
+    if fused_norm:
+        x = _fused_norm(module, x)
+    return linear(x, module.weight, rule), None
+
+
+def apply_to_model(model, rule: str) -> list:
+    """--mxfp4-emulate all_linear: route every TE (LayerNorm)Linear inside the decoder blocks
+    through the emulated MXFP4 GEMM. Returns the patched module names."""
+    import types
+
+    from megatron.core.extensions.transformer_engine import (
+        TELayerNormColumnParallelLinear,
+        TELinear,
+    )
+
+    patched = []
+    decoder = getattr(model, "decoder", None)
+    if decoder is None:
+        raise ValueError("--mxfp4-emulate all_linear expects a model with a .decoder block")
+    for name, mod in decoder.named_modules():
+        fused = isinstance(mod, TELayerNormColumnParallelLinear)
+        if not (fused or isinstance(mod, TELinear)):
+            continue
+        if getattr(mod, "use_bias", False):
+            raise ValueError(f"--mxfp4-emulate all_linear: {name} has a bias (use --disable-bias-linear)")
+        if getattr(mod, "tp_size", 1) != 1 or getattr(mod, "sequence_parallel", False):
+            raise ValueError(f"--mxfp4-emulate all_linear needs TP = 1 ({name})")
+        mod.forward = types.MethodType(
+            lambda self, x, _f=fused: _te_linear_forward(self, x, rule, _f), mod)
+        patched.append(name)
+    return patched
