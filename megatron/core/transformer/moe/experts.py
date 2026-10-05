@@ -602,6 +602,17 @@ class TEGroupedMLP(MegatronModule):
                 intermediate_parallel = intermediate_parallel.to(original_dtype)
         return intermediate_parallel
 
+    def _expert_gemm(self, linear, x, tokens_per_expert):
+        """linear_fc1 / linear_fc2 over the local experts' token segments. With
+        --mxfp4-emulate the GEMMs run in emulated MXFP4 (megatron/core/mxfp4_emulation.py)."""
+        if self.config.mxfp4_emulate is not None:
+            from megatron.core import mxfp4_emulation
+
+            return mxfp4_emulation.te_grouped_linear_forward(
+                linear, x, tokens_per_expert, self.config.mxfp4_scale_rule
+            )
+        return apply_module(linear)(x, tokens_per_expert)
+
     def forward(
         self,
         permuted_local_hidden_states: torch.Tensor,
@@ -668,8 +679,8 @@ class TEGroupedMLP(MegatronModule):
         ) as permuted_local_hidden_states:
             if glu_stats.is_active():  # --log-glu-stats: GEMM input for error stats
                 glu_stats.stash_fc1_input(permuted_local_hidden_states)
-            fc1_output, bias_parallel = apply_module(self.linear_fc1)(
-                permuted_local_hidden_states, tokens_per_expert
+            fc1_output, bias_parallel = self._expert_gemm(
+                self.linear_fc1, permuted_local_hidden_states, tokens_per_expert
             )
         if self.offload_expert_fc1:
             fc1_output = off_interface.group_commit(
@@ -694,7 +705,9 @@ class TEGroupedMLP(MegatronModule):
                 bias_act_output = self.bias_act_func(
                     fc1_output, bias_parallel, permuted_probs, tokens_per_expert
                 )
-        output, output_bias = apply_module(self.linear_fc2)(bias_act_output, tokens_per_expert)
+        output, output_bias = self._expert_gemm(
+            self.linear_fc2, bias_act_output, tokens_per_expert
+        )
         if self.activation_recompute:
             self.activation_checkpoint.discard_output_and_register_recompute(output)
 
