@@ -105,7 +105,10 @@ def qdq(x: torch.Tensor, rule: str, dim: int = -1) -> torch.Tensor:
     if pad:
         widths = [0, 0] * (x.ndim - 1 - dim) + [0, pad]
         x = torch.nn.functional.pad(x, widths)
-    q = _qdq_compiled(x, rule, dim)
+    # A plain, detached tensor: otherwise dynamo compiles separate versions for nn.Parameter
+    # vs Tensor inputs and for requires_grad True/False (27 recompiles per rank in the 5B
+    # smoke). Gradients never flow through qdq; the autograd Functions below own them.
+    q = _qdq_compiled(x.detach(), rule, dim)
     return q.narrow(dim, 0, n) if pad else q
 
 
