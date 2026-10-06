@@ -58,44 +58,87 @@ def scale_exponent(amax: torch.Tensor, rule: str) -> torch.Tensor:
     return e.clamp(min=_E8M0_MIN)
 
 
-def _qdq_lastdim(x: torch.Tensor, rule: str) -> torch.Tensor:
-    """Quantize-dequantize along the last dim (a multiple of 32). Returns x's dtype."""
-    xb = x.reshape(*x.shape[:-1], x.shape[-1] // BLOCK, BLOCK)
-    amax = xb.abs().amax(-1, keepdim=True)
-    s = torch.exp2(scale_exponent(amax, rule))
-    y = xb.float() / s
+def _qdq_dim(x: torch.Tensor, rule: str, dim: int) -> torch.Tensor:
+    """Quantize-dequantize in blocks of 32 along ``dim`` (a multiple of 32), keeping x's layout:
+    the dim is split into (n/32, 32) and the block max taken over the 32-axis, so no transpose
+    copy is needed for the dgrad/wgrad axes. Returns x's dtype."""
+    xb = x.unflatten(dim, (x.shape[dim] // BLOCK, BLOCK))
+    amax = xb.abs().amax(dim + 1, keepdim=True)
+    e = scale_exponent(amax, rule)
+    # every divisor is a power of two, so multiplying by its exact reciprocal is bit-identical
+    y = xb.float() * torch.exp2(-e)
     a = y.abs().clamp(max=6.0)
-    step = torch.where(a < 2, 0.5, torch.where(a < 4, 1.0, 2.0))
-    q = torch.copysign((torch.round(a / step) * step).clamp(max=6.0), y)   # round: half to even
-    return (q * s).to(x.dtype).reshape(x.shape)
+    big = a >= 4
+    small = a < 2
+    inv_step = torch.where(small, 2.0, torch.where(big, 0.5, 1.0))        # 1 / grid spacing
+    step = torch.where(small, 0.5, torch.where(big, 2.0, 1.0))
+    q = torch.copysign((torch.round(a * inv_step) * step).clamp(max=6.0), y)  # half to even
+    return (q * torch.exp2(e)).to(x.dtype).flatten(dim, dim + 1)
 
 
 _qdq_compiled = None
 
 
 def qdq(x: torch.Tensor, rule: str, dim: int = -1) -> torch.Tensor:
-    """MXFP4 quantize-dequantize of ``x`` in blocks of 32 along ``dim`` (must divide by 32)."""
+    """MXFP4 quantize-dequantize of ``x`` in blocks of 32 along ``dim``. A ragged last block is
+    zero-padded (a zero never raises the block max; hardware pads too)."""
     global _qdq_compiled
     if _qdq_compiled is None:
         try:
-            _qdq_compiled = torch.compile(_qdq_lastdim, dynamic=True)
+            _qdq_compiled = torch.compile(_qdq_dim, dynamic=True)
         except Exception:  # noqa: BLE001  (no inductor: fall back to eager)
-            _qdq_compiled = _qdq_lastdim
+            _qdq_compiled = _qdq_dim
     dim = dim % x.ndim
-    xt = x if dim == x.ndim - 1 else x.transpose(dim, -1)
-    n = xt.shape[-1]
+    n = x.shape[dim]
     pad = (-n) % BLOCK
-    if pad:  # ragged last block: zero padding never raises the block max (hardware pads too)
-        xt = torch.nn.functional.pad(xt, (0, pad))
-    q = _qdq_compiled(xt.contiguous(), rule)
     if pad:
-        q = q[..., :n]
-    return q if dim == x.ndim - 1 else q.transpose(dim, -1)
+        widths = [0, 0] * (x.ndim - 1 - dim) + [0, pad]
+        x = torch.nn.functional.pad(x, widths)
+    q = _qdq_compiled(x, rule, dim)
+    return q.narrow(dim, 0, n) if pad else q
+
+
+# Quantized weights are cached within one training step: weights only change in
+# optimizer.step, while a step runs several micro-batches. The cache is off unless
+# training.train_step brackets the step with new_step() / end_step(), so evaluation, tests and
+# anything else always quantize afresh. Keys use the weight objects' identity, which is only
+# safe within a step.
+_WCACHE = {}
+_CACHE_ON = False
+
+
+def new_step():
+    """Start a training step: clear the quantized-weight cache and enable it."""
+    global _CACHE_ON
+    _WCACHE.clear()
+    _CACHE_ON = True
+
+
+def end_step():
+    """After optimizer.step: the weights changed, so clear and disable the cache."""
+    global _CACHE_ON
+    _WCACHE.clear()
+    _CACHE_ON = False
+
+
+def _cached(key, make):
+    if not _CACHE_ON:
+        return make()
+    out = _WCACHE.get(key)
+    if out is None:
+        out = make()
+        _WCACHE[key] = out
+    return out
+
+
+def _to_device(values, device, dtype):
+    """Host list -> device tensor without a stream sync (pinned, non-blocking copy)."""
+    return torch.tensor(values, dtype=dtype).pin_memory().to(device, non_blocking=True)
 
 
 def _offsets(counts, device):
     """Cumulative segment ends, the ``offs`` argument of torch._grouped_mm."""
-    return torch.tensor(list(itertools.accumulate(counts)), device=device, dtype=torch.int32)
+    return _to_device(list(itertools.accumulate(counts)), device, torch.int32)
 
 
 class _MXFP4GroupedLinear(torch.autograd.Function):
@@ -108,7 +151,8 @@ class _MXFP4GroupedLinear(torch.autograd.Function):
         ctx.m_splits, ctx.rule = list(m_splits), rule
         ctx.save_for_backward(x, *weights)
         xq = qdq(x, rule, dim=-1)                                           # [T, K]
-        wq = qdq(torch.stack(weights), rule, dim=-1)                        # [E, N, K] along K
+        wq = _cached((id(weights[0]), rule, "K"),
+                     lambda: qdq(torch.stack(weights), rule, dim=-1))       # [E, N, K] along K
         offs = _offsets(ctx.m_splits, x.device)
         return torch._grouped_mm(xq, wq.transpose(1, 2), offs=offs)          # [T, N]
 
@@ -121,14 +165,19 @@ class _MXFP4GroupedLinear(torch.autograd.Function):
         dx = None
         if ctx.needs_input_grad[0]:
             dyq = qdq(dy, rule, dim=-1)                                     # along N
-            wq = qdq(torch.stack(weights), rule, dim=1)                     # [E, N, K] along N
+            wq = _cached((id(weights[0]), rule, "N"),
+                         lambda: qdq(torch.stack(weights), rule, dim=1))    # [E, N, K] along N
             dx = torch._grouped_mm(dyq, wq, offs=offs)                       # [T, K]
         # wgrad: contraction over each expert's tokens -> pad every segment to a multiple of 32
         padded = [int(math.ceil(m / BLOCK) * BLOCK) for m in m_splits]
         if sum(padded) != sum(m_splits):
-            starts = [0] + list(itertools.accumulate(padded))[:-1]
-            rows = torch.cat([torch.arange(m, device=x.device) + p0
-                              for m, p0 in zip(m_splits, starts)])
+            # destination row of token t of expert e: t + (padded start - unpadded start of e)
+            shift = [p - u for p, u in zip([0] + list(itertools.accumulate(padded))[:-1],
+                                           [0] + list(itertools.accumulate(m_splits))[:-1])]
+            n_tok = sum(m_splits)
+            rows = torch.arange(n_tok, device=x.device) + torch.repeat_interleave(
+                _to_device(shift, x.device, torch.int64),
+                _to_device(m_splits, x.device, torch.int64), output_size=n_tok)
             xp = x.new_zeros(sum(padded), x.shape[1]).index_copy_(0, rows, x)
             dyp = dy.new_zeros(sum(padded), dy.shape[1]).index_copy_(0, rows, dy)
         else:
@@ -182,14 +231,18 @@ class _MXFP4Linear(torch.autograd.Function):
     def forward(ctx, x, w, rule):
         ctx.rule = rule
         ctx.save_for_backward(x, w)
-        return qdq(x, rule, dim=-1) @ qdq(w, rule, dim=1).t()
+        wq = _cached((id(w), rule, "K"), lambda: qdq(w, rule, dim=1))
+        return qdq(x, rule, dim=-1) @ wq.t()
 
     @staticmethod
     def backward(ctx, dy):
         x, w = ctx.saved_tensors
         rule = ctx.rule
         dy = dy.contiguous()
-        dx = qdq(dy, rule, dim=-1) @ qdq(w, rule, dim=0) if ctx.needs_input_grad[0] else None
+        dx = None
+        if ctx.needs_input_grad[0]:
+            wq = _cached((id(w), rule, "N"), lambda: qdq(w, rule, dim=0))
+            dx = qdq(dy, rule, dim=-1) @ wq
         dw = qdq(dy, rule, dim=0).t() @ qdq(x, rule, dim=0)                 # along tokens
         if hasattr(w, "main_grad") and getattr(w, "grad_added_to_main_grad", None) is not None:
             w.main_grad.add_(dw.float())

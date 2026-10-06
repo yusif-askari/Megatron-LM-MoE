@@ -1940,6 +1940,11 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                                      (iteration + 1) % args.save_wgrads_interval == 0)
     grad_norm = None
     while rerun_state_machine.should_run_forward_backward(data_iterator):
+        if getattr(args, 'mxfp4_emulate', None) is not None:
+            # quantized weights are reused across this step's micro-batches
+            from megatron.core import mxfp4_emulation
+
+            mxfp4_emulation.new_step()
         # Set grad to zero.
         for model_chunk in model:
             model_chunk.zero_grad_buffer()
@@ -2070,6 +2075,10 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     skip_reduce_check = args.skip_reduce_check and \
         (args.optimizer == 'md_decoupling' and isinstance(optimizer, LayerWiseDistributedOptimizer))
 
+    if getattr(args, 'mxfp4_emulate', None) is not None:
+        from megatron.core import mxfp4_emulation
+
+        mxfp4_emulation.end_step()  # weights change in the step below
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
     if args.optimizer == 'md_decoupling' and args.check_grad_norm and isinstance(optimizer, LayerWiseDistributedOptimizer):
         update_successful, grad_norm, num_zeros_in_grad = optimizer.step_after_grad_norm(grad_norm)
