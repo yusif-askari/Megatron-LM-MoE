@@ -23,6 +23,8 @@ Scopes (``--mxfp4-emulate``):
 Scale rules (``--mxfp4-scale-rule``):
     floor  OCP spec / tensorcast default: e = floor(log2 amax) - 2. The block max lands in
            [4, 8)·s and is clipped to 6·s whenever it is above 6·s (~42% of blocks).
+    none   no quantization at all: the emulated GEMM path in plain bf16, to check that the
+           plumbing (patching, norms, main_grad, weight cache) reproduces the bf16 run.
     alto   ALTO ``blockscale_selection="default"`` (AMD-AGI/ALTO rad/lpt,
            alto/kernels/fp4/mxfp4/mxfp_quantization.py::_calculate_scales): the same, but
            e + 1 when amax/s >= 7. Implemented bit for bit: amax in the operand dtype, +0.25 on
@@ -35,7 +37,7 @@ import math
 import torch
 
 BLOCK = 32
-RULES = ("floor", "alto")
+RULES = ("floor", "alto", "none")   # "none": no quantization, to check the plumbing
 _E8M0_MIN = -126            # ALTO clamps the biased scale to >= 1
 
 
@@ -83,6 +85,8 @@ def qdq(x: torch.Tensor, rule: str, dim: int = -1) -> torch.Tensor:
     """MXFP4 quantize-dequantize of ``x`` in blocks of 32 along ``dim``. A ragged last block is
     zero-padded (a zero never raises the block max; hardware pads too)."""
     global _qdq_compiled
+    if rule == "none":          # plumbing check: the emulated path with quantization switched off
+        return x
     if _qdq_compiled is None:
         # One compiled graph per variant (rank, axis, rule, ragged or not): a full model needs
         # a few dozen. Past dynamo's default limit of 8 the rest would silently run eager
