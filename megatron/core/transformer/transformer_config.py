@@ -309,10 +309,11 @@ class TransformerConfig(ModelParallelConfig):
     latent projections); embedding, output layer and router stay bf16. Needs TEGroupedMLP,
     TP 1, expert TP 1, bias-free linears and no --fp8-format / --fp4-format."""
 
-    mxfp4_scale_rule: Literal['floor', 'alto'] = 'alto'
+    mxfp4_scale_rule: Literal['floor', 'alto', 'none'] = 'alto'
     """Block-scale rule of --mxfp4-emulate. ``'floor'``: OCP spec, e = floor(log2 amax) - 2 (the
     block max is clipped whenever it lands above 6*s). ``'alto'``: AMD ALTO's default, the same
-    but one power of two up when amax/s >= 7."""
+    but one power of two up when amax/s >= 7. ``'none'``: no quantization (checks the emulated
+    path against plain bf16)."""
 
     exp_learnable_gate: Optional[str] = None
     """Name of a learnable activation-sweep gate from megatron/core/exp_gates.py
