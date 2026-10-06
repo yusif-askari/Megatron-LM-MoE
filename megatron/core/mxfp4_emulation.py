@@ -87,9 +87,9 @@ def qdq(x: torch.Tensor, rule: str, dim: int = -1) -> torch.Tensor:
         # One compiled graph per variant (rank, axis, rule, ragged or not): a full model needs
         # a few dozen. Past dynamo's default limit of 8 the rest would silently run eager
         # (several times slower), so raise it once; each variant still compiles only once.
-        import torch._dynamo
+        import torch._dynamo as _dynamo  # "import torch._dynamo" would make torch a local name
 
-        cfg = torch._dynamo.config
+        cfg = _dynamo.config
         for name, floor in (("recompile_limit", 256), ("cache_size_limit", 256),
                             ("accumulated_recompile_limit", 4096),
                             ("accumulated_cache_size_limit", 4096)):
