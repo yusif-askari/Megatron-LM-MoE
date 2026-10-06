@@ -196,3 +196,147 @@ def test_weight_cache_within_step():
         mx.end_step()
     assert torch.equal(mx.linear(x, w, "alto"), 2.0 * ref)
 
+
+# ---- ALTO recipe: stochastic rounding, 32x32 weight tiles, Hadamard along tokens -------------
+def test_sr_unbiased_and_on_grid():
+    """Blocks built so nothing clips (block max exactly 6 * 2^j): SR must then be unbiased and
+    land only on the two grid neighbours of each value."""
+    torch.manual_seed(7)
+    j = torch.randint(-3, 4, (64, 8, 1), device="cuda").float()
+    s = torch.exp2(j)                                              # the block scale
+    x = (torch.rand(64, 8, 32, device="cuda") * 12 - 6) * s       # |x/s| < 6
+    x[..., 0] = 6.0 * s[..., 0]                                    # block max = 6 s -> scale s
+    x = x.reshape(64, 256)
+    s = s.expand(64, 8, 32).reshape(64, 256)
+    samples = torch.stack([mx.qdq(x, "floor", sr=True) for _ in range(400)])
+    y = samples / s
+    a = (x / s).abs()
+    step = torch.where(a < 2, 0.5, torch.where(a < 4, 1.0, 2.0))
+    lo = torch.floor(a / step) * step
+    assert torch.isin(y.abs(), GRID.to(x.device)).all()
+    assert ((y.abs() == lo) | (y.abs() == (lo + step).clamp(max=6.0))).all()
+    # unbiased: per element, |mean - x| within ~5 sd of the Monte-Carlo error (sd <= step/40)
+    err = ((samples.mean(0) - x) / s).abs() / step
+    assert float(err.max()) < 0.13
+    assert float(((samples.mean(0) - x) / s).mean().abs()) < 2e-3   # no systematic bias
+
+
+def ref_tile(w, rule):
+    """Independent 32x32-tile reference: each tile flattened to 1024 values, one scale. Ragged
+    edges: zero-pad to whole tiles, quantize, slice back."""
+    n0, k0 = w.shape[-2:]
+    if n0 % 32 or k0 % 32:
+        wp = torch.nn.functional.pad(w, (0, (-k0) % 32, 0, (-n0) % 32))
+        return ref_tile(wp, rule)[..., :n0, :k0]
+    n, k = w.shape[-2:]
+    t = w.float().reshape(*w.shape[:-2], n // 32, 32, k // 32, 32).transpose(-3, -2)
+    flat = t.reshape(*t.shape[:-2], 1024)
+    amax = flat.abs().amax(-1, keepdim=True)
+    mant, ex = torch.frexp(amax)
+    e = (ex - 3).float()
+    if rule == "alto":
+        e = e + (2 * mant >= 1.75).float()
+    e = torch.where(amax > 0, e, torch.full_like(e, -126.0)).clamp(min=-126)
+    sc = torch.exp2(e)
+    a = (flat / sc).abs().clamp(max=6.0)
+    g, mids = GRID.to(w.device), MIDS.to(w.device)
+    i = torch.bucketize(a.contiguous(), mids)
+    tie = (i < 7) & (a == mids[i.clamp(max=6)])
+    i = torch.where(tie & (i % 2 == 1), i + 1, i)
+    q = (torch.sign(flat) * g[i] * sc).reshape(t.shape).transpose(-3, -2)
+    return q.reshape(w.shape).to(w.dtype)
+
+
+@pytest.mark.parametrize("rule", ["floor", "alto"])
+def test_tile_matches_reference(rule):
+    torch.manual_seed(8)
+    w = (torch.randn(3, 1408, 640, device="cuda") * torch.exp(torch.randn(3, 1408, 1, device="cuda")))
+    w = w.to(torch.bfloat16)
+    assert torch.equal(mx.qdq_tile(w, rule), ref_tile(w, rule))
+
+
+def test_hadamard_orthonormal_and_wgrad_invariant():
+    mx.new_step()
+    try:
+        h = mx.hadamard(torch.device("cuda"))
+        assert h is mx.hadamard(torch.device("cuda", torch.cuda.current_device()))  # one per step
+        hd = h.double()                                       # fp64: the container runs fp32 as TF32
+        assert float((hd @ hd.t() - torch.eye(32, device="cuda", dtype=torch.float64)).abs().max()) < 1e-6
+        assert torch.allclose(h.abs(), torch.full_like(h, 32 ** -0.5))
+        x = torch.randn(256, 64, device="cuda", dtype=torch.float64)
+        dy = torch.randn(256, 48, device="cuda", dtype=torch.float64)
+        hx, hdy = mx.rotate_tokens(x), mx.rotate_tokens(dy)
+        assert torch.allclose(hdy.t() @ hx, dy.t() @ x, atol=1e-9)
+        h1 = h.clone()
+    finally:
+        mx.end_step()
+    mx.new_step()
+    try:
+        assert not torch.equal(mx.hadamard(torch.device("cuda")), h1)   # redrawn each step
+    finally:
+        mx.end_step()
+
+
+def ref_alto_grouped(x, m_splits, ws, rule, dy):
+    """ALTO recipe per expert, round-to-nearest (stochastic rounding switched off)."""
+    ys, dxs, dws, o = [], [], [], 0
+    for m, w in zip(m_splits, ws):
+        xe, dye = x[o:o + m], dy[o:o + m]
+        o += m
+        wt = ref_tile(w, rule).float()
+        ys.append(mx.qdq(xe, rule).float() @ wt.t())
+        dxs.append(mx.qdq(dye, rule).float() @ wt)
+        mp = -(-m // 32) * 32
+        xp = torch.nn.functional.pad(xe, (0, 0, 0, mp - m))
+        dyp = torch.nn.functional.pad(dye, (0, 0, 0, mp - m))
+        if mp:
+            xp, dyp = mx.rotate_tokens(xp), mx.rotate_tokens(dyp)
+        dws.append(mx.qdq(dyp, rule, 0).float().t() @ mx.qdq(xp, rule, 0).float())
+    return torch.cat(ys), torch.cat(dxs), dws
+
+
+@pytest.mark.parametrize("rule", ["floor", "alto"])
+def test_alto_recipe_grouped_and_dense(rule, monkeypatch):
+    monkeypatch.setattr(mx, "_FORCE_RNE", True)
+    torch.manual_seed(9)
+    m_splits = [37, 0, 64, 5, 130]
+    K, N = 640, 1408
+    x = torch.randn(sum(m_splits), K, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    ws = [(torch.randn(N, K, device="cuda") / 25).to(torch.bfloat16).requires_grad_()
+          for _ in m_splits]
+    mx.new_step()
+    try:
+        y = mx.grouped_linear(x, m_splits, ws, rule, recipe="alto")
+        dy = torch.randn_like(y)
+        y.backward(dy)
+        y_ref, dx_ref, dw_ref = ref_alto_grouped(x.detach(), m_splits, [w.detach() for w in ws],
+                                                 rule, dy)
+        # dense: one "expert" with all tokens, ragged N
+        xd = torch.randn(96, 1280, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        wd = (torch.randn(4106, 1280, device="cuda") / 36).to(torch.bfloat16).requires_grad_()
+        yd = mx.linear(xd, wd, rule, recipe="alto")
+        dyd = torch.randn_like(yd)
+        yd.backward(dyd)
+        yd_ref, dxd_ref, dwd_ref = ref_alto_grouped(xd.detach(), [96], [wd.detach()], rule, dyd)
+    finally:
+        mx.end_step()
+    rel = lambda a, b: float((a.float() - b).norm() / b.norm().clamp(min=1e-12))
+    assert rel(y, y_ref) < 1e-2 and rel(x.grad, dx_ref) < 1e-2
+    for w, d in zip(ws, dw_ref):
+        assert rel(w.grad, d) < 1e-2 if d.abs().sum() > 0 else float(w.grad.float().abs().sum()) == 0
+    assert rel(yd, yd_ref) < 1e-2 and rel(xd.grad, dxd_ref) < 1e-2 and rel(wd.grad, dwd_ref[0]) < 1e-2
+
+
+def test_alto_recipe_sr_is_used_in_backward():
+    """With stochastic rounding on, two identical backward passes give different dx."""
+    torch.manual_seed(10)
+    x = torch.randn(128, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    w = (torch.randn(512, 256, device="cuda") / 16).to(torch.bfloat16).requires_grad_()
+    dy = torch.randn(128, 512, device="cuda", dtype=torch.bfloat16)
+    grads = []
+    for _ in range(2):
+        x.grad = None
+        mx.linear(x, w, "alto", recipe="alto").backward(dy)
+        grads.append(x.grad.clone())
+    assert not torch.equal(grads[0], grads[1])
+
