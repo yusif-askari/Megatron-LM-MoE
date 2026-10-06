@@ -84,6 +84,17 @@ def qdq(x: torch.Tensor, rule: str, dim: int = -1) -> torch.Tensor:
     zero-padded (a zero never raises the block max; hardware pads too)."""
     global _qdq_compiled
     if _qdq_compiled is None:
+        # One compiled graph per variant (rank, axis, rule, ragged or not): a full model needs
+        # a few dozen. Past dynamo's default limit of 8 the rest would silently run eager
+        # (several times slower), so raise it once; each variant still compiles only once.
+        import torch._dynamo
+
+        cfg = torch._dynamo.config
+        for name, floor in (("recompile_limit", 256), ("cache_size_limit", 256),
+                            ("accumulated_recompile_limit", 4096),
+                            ("accumulated_cache_size_limit", 4096)):
+            if hasattr(cfg, name):
+                setattr(cfg, name, max(getattr(cfg, name), floor))
         try:
             _qdq_compiled = torch.compile(_qdq_dim, dynamic=True)
         except Exception:  # noqa: BLE001  (no inductor: fall back to eager)
