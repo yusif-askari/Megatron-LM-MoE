@@ -309,6 +309,12 @@ class TransformerConfig(ModelParallelConfig):
     latent projections); embedding, output layer and router stay bf16. Needs TEGroupedMLP,
     TP 1, expert TP 1, bias-free linears and no --fp8-format / --fp4-format."""
 
+    mxfp4_recipe: Literal['plain', 'alto'] = 'plain'
+    """Recipe of --mxfp4-emulate. ``'plain'``: round-to-nearest, 1-D blocks along each GEMM's
+    contraction dim. ``'alto'``: AMD ALTO's training recipe: 32x32 weight tiles shared by
+    forward and dgrad, stochastic rounding of the gradient operands, and a random Hadamard
+    rotation along tokens before the wgrad quantization."""
+
     mxfp4_scale_rule: Literal['floor', 'alto', 'none'] = 'alto'
     """Block-scale rule of --mxfp4-emulate. ``'floor'``: OCP spec, e = floor(log2 amax) - 2 (the
     block max is clipped whenever it lands above 6*s). ``'alto'``: AMD ALTO's default, the same

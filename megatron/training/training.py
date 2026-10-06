@@ -1481,9 +1481,12 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         from megatron.core import mxfp4_emulation
 
         for model_module in model:
-            patched = mxfp4_emulation.apply_to_model(model_module, args.mxfp4_scale_rule)
+            patched = mxfp4_emulation.apply_to_model(
+                model_module, args.mxfp4_scale_rule, args.mxfp4_recipe
+            )
         print_rank_0(
-            f'> --mxfp4-emulate all_linear ({args.mxfp4_scale_rule}): {len(patched)} TE linear '
+            f'> --mxfp4-emulate all_linear ({args.mxfp4_scale_rule}, recipe {args.mxfp4_recipe}): '
+            f'{len(patched)} TE linear '
             f'modules + the routed experts run in emulated MXFP4: {", ".join(patched)}'
         )
 

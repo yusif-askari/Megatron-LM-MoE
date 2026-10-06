@@ -609,7 +609,8 @@ class TEGroupedMLP(MegatronModule):
             from megatron.core import mxfp4_emulation
 
             return mxfp4_emulation.te_grouped_linear_forward(
-                linear, x, tokens_per_expert, self.config.mxfp4_scale_rule
+                linear, x, tokens_per_expert, self.config.mxfp4_scale_rule,
+                self.config.mxfp4_recipe,
             )
         return apply_module(linear)(x, tokens_per_expert)
 
