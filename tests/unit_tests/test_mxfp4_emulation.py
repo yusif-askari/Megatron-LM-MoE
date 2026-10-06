@@ -178,3 +178,21 @@ def test_fused_norm_matches_te():
         _, ln_out = mod(x)
         ours = mx._fused_norm(mod, x)
         assert float((ours.float() - ln_out.float()).abs().max()) <= 2 ** -6 * float(ln_out.abs().max())
+
+
+def test_weight_cache_within_step():
+    torch.manual_seed(6)
+    x = torch.randn(64, 256, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(128, 256, device="cuda", dtype=torch.bfloat16)
+    ref = mx.linear(x, w, "alto")                     # cache off: fresh quantization
+    mx.new_step()
+    try:
+        y1 = mx.linear(x, w, "alto")
+        y2 = mx.linear(x, w, "alto")                  # served from the cache
+        assert torch.equal(y1, ref) and torch.equal(y2, ref)
+        with torch.no_grad():
+            w.mul_(2.0)                               # would be stale if the cache stayed on
+    finally:
+        mx.end_step()
+    assert torch.equal(mx.linear(x, w, "alto"), 2.0 * ref)
+
