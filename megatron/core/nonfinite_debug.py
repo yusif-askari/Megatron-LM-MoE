@@ -108,3 +108,33 @@ def install(chunk):
             m.register_forward_hook(router_hook)
     chunk.register_forward_hook(lambda module, inputs, out: _check("end of forward", chunk))
     return n
+
+
+def check_grads(chunks):
+    """Before the optimizer step: name every parameter whose reduced gradient is inf/NaN.
+
+    One host sync per step. On a hit, print this rank's offending parameters (gradients are
+    already all-reduced, so dense parameters match across ranks; experts differ per EP rank)
+    and raise before the optimizer writes NaN into the weights.
+    """
+    named = []
+    for chunk in chunks:
+        for n, p in chunk.named_parameters():
+            g = getattr(p, "main_grad", None)
+            if g is None:
+                g = p.grad
+            if g is not None and g.numel():
+                named.append((n, g))
+    if not named:
+        return
+    flags = torch.stack([~torch.isfinite(g).all() for _, g in named])
+    if not flags.any().item():
+        return
+    bad = [(n, g) for (n, g), f in zip(named, flags.tolist()) if f]
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    desc = [f"{n} (nan {torch.isnan(g).sum().item()}, inf {torch.isinf(g).sum().item()} "
+            f"of {g.numel()})" for n, g in bad[:20]]
+    msg = (f"[NONFINITE] rank {rank} iteration {_iteration()} gradients: {len(bad)}/{len(named)} "
+           f"parameters have inf/NaN gradients: {desc}")
+    print(msg, flush=True)
+    raise RuntimeError(msg)

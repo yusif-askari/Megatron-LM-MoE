@@ -2089,6 +2089,10 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         from megatron.core import mxfp4_emulation
 
         mxfp4_emulation.end_step()  # weights change in the step below
+    from megatron.core import nonfinite_debug
+
+    if nonfinite_debug.ENABLED:
+        nonfinite_debug.check_grads(model)  # stop before NaN gradients reach the weights
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
     if args.optimizer == 'md_decoupling' and args.check_grad_norm and isinstance(optimizer, LayerWiseDistributedOptimizer):
         update_successful, grad_norm, num_zeros_in_grad = optimizer.step_after_grad_norm(grad_norm)
