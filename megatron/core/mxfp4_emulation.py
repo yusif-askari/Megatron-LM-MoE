@@ -53,20 +53,22 @@ _E8M0_MIN = -126            # ALTO clamps the biased scale to >= 1
 
 def scale_exponent(amax: torch.Tensor, rule: str) -> torch.Tensor:
     """Unbiased exponent e of the block scale 2^e, as float32. ``amax`` keeps the operand dtype."""
-    if rule == "floor":
-        a = amax.float()
-        e = (torch.frexp(a).exponent - 1 - 2).float()      # exact floor(log2 a) - 2
-        e = torch.where(a > 0, e, torch.full_like(e, _E8M0_MIN))
-    elif rule == "alto":
-        if amax.dtype == torch.bfloat16:
-            bits = amax.view(torch.int16).to(torch.int32) & 0x7FFF
-            e = (((bits + (1 << 5)) & (0x1FF << 7)) >> 7) - 127 - 2
-        else:
-            bits = amax.float().view(torch.int32).to(torch.int64) & 0x7FFFFFFF
-            e = (((bits + (1 << 21)) & (0x1FF << 23)) >> 23) - 127 - 2
-        e = e.float()
-    else:
+    # Both rules read the exponent field of amax directly. floor(log2 amax) is the biased exponent
+    # - 127 for normal numbers; zero and subnormal amax have field 0 and land on the clamp below
+    # (scale 2^-126, the block quantizes to ~0). Do not use torch.frexp here: on CUDA it returns
+    # a garbage exponent for subnormal and inf amax, which gave a scale of 2^huge = inf and a
+    # whole block of 0 * inf = NaN.
+    if rule not in ("floor", "alto"):
         raise ValueError(f"unknown MXFP4 scale rule {rule!r}, expected one of {RULES}")
+    if amax.dtype == torch.bfloat16:
+        bits = amax.view(torch.int16).to(torch.int32) & 0x7FFF
+        carry = (1 << 5) if rule == "alto" else 0          # alto: +0.25 on the significand
+        e = (((bits + carry) & (0x1FF << 7)) >> 7) - 127 - 2
+    else:
+        bits = amax.float().view(torch.int32).to(torch.int64) & 0x7FFFFFFF
+        carry = (1 << 21) if rule == "alto" else 0
+        e = (((bits + carry) & (0x1FF << 23)) >> 23) - 127 - 2
+    e = e.float()
     return e.clamp(min=_E8M0_MIN)
 
 
