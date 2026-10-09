@@ -1490,6 +1490,13 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             f'modules + the routed experts run in emulated MXFP4: {", ".join(patched)}'
         )
 
+    # NONFINITE_CHECK=1 (debug): stop at the first inf/NaN in the forward pass, naming the module.
+    from megatron.core import nonfinite_debug
+
+    if nonfinite_debug.ENABLED:
+        hooked = sum(nonfinite_debug.install(model_module) for model_module in model)
+        print_rank_0(f'> NONFINITE_CHECK=1: inf/NaN tracer on {hooked} modules')
+
     # Set tensor model parallel attributes if not set.
     # Only parameters that are already tensor model parallel have these
     # attributes set for them. We should make sure the default attributes
