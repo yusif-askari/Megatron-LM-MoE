@@ -340,3 +340,18 @@ def test_alto_recipe_sr_is_used_in_backward():
         grads.append(x.grad.clone())
     assert not torch.equal(grads[0], grads[1])
 
+
+
+@pytest.mark.parametrize("rule", ["floor", "alto"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_subnormal_and_inf_blocks_stay_finite(rule, dtype):
+    """A block whose values are all subnormal (e.g. SwiGLU gradients deep in the dead zone)
+    must quantize to ~0, not NaN; an inf must not turn the rest of its block into NaN. The
+    floor rule used torch.frexp, which on CUDA gave 0 * inf = NaN for both."""
+    x = (torch.randn(4, 64, device="cuda") * 1e-39).to(dtype)
+    assert torch.isfinite(mx.qdq(x, rule)).all()
+    assert torch.isfinite(mx.qdq(x, rule, sr=True)).all()
+    y = torch.randn(1, 64, device="cuda", dtype=dtype)
+    y[0, 3] = float("inf")
+    q = mx.qdq(y, rule)
+    assert torch.isfinite(q[0, torch.arange(64, device="cuda") != 3]).all()
