@@ -116,6 +116,7 @@ def _qdq_tile(x: torch.Tensor, rule: str) -> torch.Tensor:
 
 _COMPILED = {}
 _FORCE_RNE = False      # tests only: replace stochastic rounding by round-to-nearest
+_RULE_OVERRIDE = None    # debug (scale_probe): "none" switches quantization off everywhere
 
 
 def _compiled(fn):
@@ -143,6 +144,8 @@ def qdq(x: torch.Tensor, rule: str, dim: int = -1, sr: bool = False) -> torch.Te
     """MXFP4 quantize-dequantize of ``x`` in blocks of 32 along ``dim``; ``sr``: stochastic
     rounding. A ragged last block is zero-padded (a zero never raises the block max; hardware
     pads too)."""
+    if _RULE_OVERRIDE is not None:
+        rule = _RULE_OVERRIDE
     if rule == "none":          # plumbing check: the emulated path with quantization switched off
         return x
     sr = sr and not _FORCE_RNE
@@ -161,6 +164,8 @@ def qdq(x: torch.Tensor, rule: str, dim: int = -1, sr: bool = False) -> torch.Te
 
 def qdq_tile(x: torch.Tensor, rule: str) -> torch.Tensor:
     """MXFP4 quantize-dequantize in 32x32 tiles over the last two dims (ragged edges padded)."""
+    if _RULE_OVERRIDE is not None:
+        rule = _RULE_OVERRIDE
     if rule == "none":
         return x
     n, k = x.shape[-2], x.shape[-1]
