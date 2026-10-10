@@ -1949,6 +1949,13 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     save_wgrads_in_this_iteration = (args.save_wgrads_interval is not None and
                                      (iteration + 1) % args.save_wgrads_interval == 0)
     grad_norm = None
+    from megatron.core import scale_probe
+
+    if scale_probe.PROBE_DIR:  # debug: finite-difference vs gradient probe on norm weights, then stop
+        pp_seq_length, pp_micro_batch_size = _pipeline_shape_args(args)
+        scale_probe.run(forward_step_func, data_iterator, model, forward_backward_func,
+                        get_num_microbatches(), pp_seq_length, pp_micro_batch_size,
+                        args.decoder_seq_length)
     while rerun_state_machine.should_run_forward_backward(data_iterator):
         if getattr(args, 'mxfp4_emulate', None) is not None:
             # quantized weights are reused across this step's micro-batches
