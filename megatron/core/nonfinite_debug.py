@@ -138,3 +138,48 @@ def check_grads(chunks):
            f"parameters have inf/NaN gradients: {desc}")
     print(msg, flush=True)
     raise RuntimeError(msg)
+
+
+GRAD_DUMP = os.environ.get("GRAD_DUMP", "")        # directory; dump gradients at the first step
+GRAD_DUMP_LAYER = os.environ.get("GRAD_DUMP_LAYER", "layers.6.")
+
+
+def dump_grads(chunks):
+    """GRAD_DUMP=<dir> (debug): at the first optimizer step, write per-parameter gradient stats
+    (every rank) and the full gradients of one layer (rank 0), then stop the job.
+
+    Stats per parameter: ||W||, ||G||, and the radial alignment cos(W, G) = <W,G>/(||W|| ||G||);
+    a gradient-descent step grows ||W|| when <W,G> < 0. For 2-D weights also per row (the axis of
+    the learned row gains): mean row cos and the fraction of rows with <W_i,G_i> < 0. Run the
+    same checkpoint and batch with --mxfp4-scale-rule none / alto / floor and compare.
+    """
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    os.makedirs(GRAD_DUMP, exist_ok=True)
+    stats, full = {}, {}
+    for chunk in chunks:
+        for n, p in chunk.named_parameters():
+            g = getattr(p, "main_grad", None)
+            if g is None:
+                g = p.grad
+            if g is None or not g.numel():
+                continue
+            w, g = p.detach().float(), g.detach().float().view_as(p)
+            s = {"shape": list(p.shape), "w_norm": w.norm().item(), "g_norm": g.norm().item(),
+                 "cos": (w * g).sum().item() / max(w.norm().item() * g.norm().item(), 1e-30)}
+            if p.ndim == 2:
+                dot = (w * g).sum(1)
+                rc = dot / (w.norm(dim=1) * g.norm(dim=1)).clamp_min(1e-30)
+                s["row_cos_mean"] = rc.mean().item()
+                s["row_grow_frac"] = (dot < 0).float().mean().item()
+            stats[n] = s
+            if rank == 0 and GRAD_DUMP_LAYER in n:
+                full[n] = g.cpu()
+    import json
+    with open(os.path.join(GRAD_DUMP, f"stats_rank{rank:03d}.json"), "w") as f:
+        json.dump({"iteration": _iteration(), "params": stats}, f)
+    if rank == 0:
+        torch.save(full, os.path.join(GRAD_DUMP, "grads_rank000.pt"))
+    print(f"[GRAD_DUMP] rank {rank}: {len(stats)} params -> {GRAD_DUMP}", flush=True)
+    if torch.distributed.is_initialized():
+        torch.distributed.barrier()
+    os._exit(0)
