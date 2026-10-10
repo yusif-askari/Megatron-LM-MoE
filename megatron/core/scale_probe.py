@@ -45,7 +45,8 @@ def run(forward_step_func, data_iterator, model, forward_backward_func, num_micr
     rank = torch.distributed.get_rank()
     dp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
     items = [next(data_iterator) for _ in range(N_BATCHES * num_microbatches)]
-    buffers = [(b, b.detach().clone()) for chunk in model for b in chunk.buffers()]
+    # torch.nn.Module.buffers explicitly: the DDP wrapper has its own `buffers` attribute (grad buffers)
+    buffers = [(b, b.detach().clone()) for chunk in model for b in torch.nn.Module.buffers(chunk)]
 
     def passes(forward_only):
         """Mean loss over all cached batches, in ONE schedule call (so the gradient all-reduce
