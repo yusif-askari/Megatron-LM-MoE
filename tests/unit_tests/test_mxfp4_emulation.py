@@ -355,3 +355,30 @@ def test_subnormal_and_inf_blocks_stay_finite(rule, dtype):
     y[0, 3] = float("inf")
     q = mx.qdq(y, rule)
     assert torch.isfinite(q[0, torch.arange(64, device="cuda") != 3]).all()
+
+
+@pytest.mark.parametrize("recipe", ["plain", "alto"])
+def test_pass_only_switch(recipe, monkeypatch):
+    """MXFP4_PASS_ONLY (debug): 'fwd' quantizes only the forward GEMM (exact bf16 gradients),
+    'bwd' only the dgrad/wgrad GEMMs (exact forward)."""
+    torch.manual_seed(0)
+    x = torch.randn(64, 96, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(48, 96, device="cuda", dtype=torch.bfloat16)
+    dy = torch.randn(64, 48, device="cuda", dtype=torch.bfloat16)
+
+    def run(only):
+        monkeypatch.setattr(mx, "_PASS_ONLY", only)
+        mx.end_step()
+        xi, wi = x.clone().requires_grad_(), w.clone().requires_grad_()
+        y = mx.linear(xi, wi, "alto", recipe)
+        y.backward(dy)
+        return y.detach(), xi.grad, wi.grad
+
+    y_q, dx_q, dw_q = run(None)
+    y_f, dx_f, dw_f = run("fwd")
+    y_b, dx_b, dw_b = run("bwd")
+    y_ex, dx_ex, dw_ex = x @ w.t(), dy @ w, dy.t() @ x
+    assert torch.equal(y_f, y_q) and torch.equal(dx_f, dx_ex) and torch.equal(dw_f, dw_ex)
+    assert torch.equal(y_b, y_ex) and not torch.equal(dx_b, dx_ex) and not torch.equal(dw_b, dw_ex)
+    if recipe == "plain":                    # no stochastic rounding: bwd matches the full path
+        assert torch.equal(dx_b, dx_q) and torch.equal(dw_b, dw_q)

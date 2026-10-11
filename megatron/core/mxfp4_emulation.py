@@ -43,6 +43,7 @@ Scale rules (``--mxfp4-scale-rule``):
 """
 import itertools
 import math
+import os
 
 import torch
 
@@ -117,6 +118,16 @@ def _qdq_tile(x: torch.Tensor, rule: str) -> torch.Tensor:
 _COMPILED = {}
 _FORCE_RNE = False      # tests only: replace stochastic rounding by round-to-nearest
 _RULE_OVERRIDE = None    # debug (scale_probe): "none" switches quantization off everywhere
+# debug: MXFP4_PASS_ONLY=fwd quantizes only the forward GEMMs (dgrad/wgrad in bf16), =bwd only
+# the dgrad and wgrad GEMMs (forward in bf16). Unset: both (normal).
+_PASS_ONLY = os.environ.get("MXFP4_PASS_ONLY") or None
+assert _PASS_ONLY in (None, "fwd", "bwd"), f"MXFP4_PASS_ONLY={_PASS_ONLY!r}: use fwd or bwd"
+
+
+def _pass_rule(rule: str, which: str) -> str:
+    """The scale rule for the GEMMs of pass ``which`` ("fwd"/"bwd"): "none" if MXFP4_PASS_ONLY
+    excludes that pass."""
+    return rule if _PASS_ONLY in (None, which) else "none"
 
 
 def _compiled(fn):
@@ -308,6 +319,7 @@ class _MXFP4GroupedLinear(torch.autograd.Function):
         assert x.shape[0] == n_tok, (x.shape, n_tok)
         ctx.m_splits, ctx.rule, ctx.recipe = list(m_splits), rule, recipe
         ctx.save_for_backward(x, *weights)
+        rule = _pass_rule(rule, "fwd")
         xq = qdq(x, rule, dim=-1)                                           # [T, K] along K
         wq = _weight_fwd(id(weights[0]), lambda: torch.stack(weights), rule, recipe)  # [E, N, K]
         offs = _offsets(ctx.m_splits, x.device)
@@ -316,7 +328,7 @@ class _MXFP4GroupedLinear(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dy):
         x, *weights = ctx.saved_tensors
-        rule, recipe, m_splits = ctx.rule, ctx.recipe, ctx.m_splits
+        rule, recipe, m_splits = _pass_rule(ctx.rule, "bwd"), ctx.recipe, ctx.m_splits
         dy = dy.contiguous()
         offs = _offsets(m_splits, x.device)
         dx = None
@@ -378,13 +390,14 @@ class _MXFP4Linear(torch.autograd.Function):
     def forward(ctx, x, w, rule, recipe):
         ctx.rule, ctx.recipe = rule, recipe
         ctx.save_for_backward(x, w)
+        rule = _pass_rule(rule, "fwd")
         wq = _weight_fwd(id(w), lambda: w, rule, recipe)
         return qdq(x, rule, dim=-1) @ wq.t()
 
     @staticmethod
     def backward(ctx, dy):
         x, w = ctx.saved_tensors
-        rule, recipe = ctx.rule, ctx.recipe
+        rule, recipe = _pass_rule(ctx.rule, "bwd"), ctx.recipe
         dy = dy.contiguous()
         dx = None
         if ctx.needs_input_grad[0]:
