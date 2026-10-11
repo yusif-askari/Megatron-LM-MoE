@@ -41,7 +41,12 @@ def _params(model, suffixes):
 def run(forward_step_func, data_iterator, model, forward_backward_func, num_microbatches,
         seq_length, micro_batch_size, decoder_seq_length):
     from megatron.core import mxfp4_emulation, parallel_state
+    from megatron.core.utils import get_model_config
 
+    # The router-metric buffers hold one sample per microbatch of a training step; one probe
+    # pass runs N_BATCHES times that many. The metrics are logging only, so switch them off.
+    config = get_model_config(model[0])
+    config.moe_router_violation_metrics = []
     rank = torch.distributed.get_rank()
     dp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
     items = [next(data_iterator) for _ in range(N_BATCHES * num_microbatches)]
