@@ -321,6 +321,11 @@ class TransformerConfig(ModelParallelConfig):
     but one power of two up when amax/s >= 7. ``'none'``: no quantization (checks the emulated
     path against plain bf16)."""
 
+    mxfp4_skip: Optional[str] = None
+    """Comma-separated substrings of decoder module names that --mxfp4-emulate all_linear leaves in
+    bf16, e.g. ``'latent_proj'`` keeps the MoE latent projections (fc1/fc2_latent_proj) in bf16.
+    Every substring must match at least one TE linear. The routed experts are not affected."""
+
     exp_learnable_gate: Optional[str] = None
     """Name of a learnable activation-sweep gate from megatron/core/exp_gates.py
     (``exp_pglu`` / ``exp_xrlglu``), set by ``--exp-gate``. The gate g(x_glu) * x_linear runs in
@@ -1725,6 +1730,8 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError("--mxfp4-emulate supports bias-free experts only")
             if (self.expert_tensor_parallel_size or 1) != 1:
                 raise ValueError("--mxfp4-emulate needs --expert-tensor-parallel-size 1")
+            if self.mxfp4_skip and self.mxfp4_emulate != 'all_linear':
+                raise ValueError("--mxfp4-skip only applies to --mxfp4-emulate all_linear")
             if self.mxfp4_emulate == 'all_linear' and self.tensor_model_parallel_size != 1:
                 raise ValueError("--mxfp4-emulate all_linear needs --tensor-model-parallel-size 1")
             if self.moe_ffn_hidden_size is not None and self.moe_ffn_hidden_size % 32:

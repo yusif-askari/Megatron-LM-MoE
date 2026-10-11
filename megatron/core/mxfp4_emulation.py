@@ -424,9 +424,10 @@ def _te_linear_forward(module, x, rule, recipe, fused_norm):
     return linear(x, module.weight, rule, recipe), None
 
 
-def apply_to_model(model, rule: str, recipe: str = "plain") -> list:
+def apply_to_model(model, rule: str, recipe: str = "plain", skip=()) -> list:
     """--mxfp4-emulate all_linear: route every TE (LayerNorm)Linear inside the decoder blocks
-    through the emulated MXFP4 GEMM. Returns the patched module names."""
+    through the emulated MXFP4 GEMM, except those whose name contains one of the ``skip``
+    substrings (--mxfp4-skip), which keep TE's own bf16 forward. Returns the patched names."""
     import types
 
     from megatron.core.extensions.transformer_engine import (
@@ -434,13 +435,17 @@ def apply_to_model(model, rule: str, recipe: str = "plain") -> list:
         TELinear,
     )
 
-    patched = []
+    patched, matched = [], set()
     decoder = getattr(model, "decoder", None)
     if decoder is None:
         raise ValueError("--mxfp4-emulate all_linear expects a model with a .decoder block")
     for name, mod in decoder.named_modules():
         fused = isinstance(mod, TELayerNormColumnParallelLinear)
         if not (fused or isinstance(mod, TELinear)):
+            continue
+        hits = [k for k in skip if k in name]
+        if hits:
+            matched.update(hits)
             continue
         if getattr(mod, "use_bias", False):
             raise ValueError(f"--mxfp4-emulate all_linear: {name} has a bias (use --disable-bias-linear)")
@@ -449,4 +454,7 @@ def apply_to_model(model, rule: str, recipe: str = "plain") -> list:
         mod.forward = types.MethodType(
             lambda self, x, _f=fused: _te_linear_forward(self, x, rule, recipe, _f), mod)
         patched.append(name)
+    unmatched = [k for k in skip if k not in matched]
+    if unmatched:
+        raise ValueError(f"--mxfp4-skip: no TE linear in the decoder matches {unmatched}")
     return patched
