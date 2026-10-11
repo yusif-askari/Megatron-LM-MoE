@@ -385,3 +385,31 @@ def test_pass_only_switch(recipe, monkeypatch):
     assert torch.equal(y_b, y_ex) and not torch.equal(dx_b, dx_ex) and not torch.equal(dw_b, dw_ex)
     if recipe == "plain":                    # no stochastic rounding: bwd matches the full path
         assert torch.equal(dx_b, dx_q) and torch.equal(dw_b, dw_q)
+
+
+def test_norm_fixed_rms(monkeypatch):
+    """NORM_FIXED_RMS: the norm uses r0 * v / rms(v); scaling v changes nothing, and the gradient
+    on v has no component along v."""
+    from megatron.core import norm_fixed_rms as nf
+
+    torch.manual_seed(0)
+    norm = torch.nn.RMSNorm(64, eps=1e-6).cuda()
+    with torch.no_grad():
+        norm.weight.copy_(torch.rand(64) + 0.5)
+    ref = torch.nn.RMSNorm(64, eps=1e-6).cuda()
+    x = torch.randn(8, 64, device="cuda")
+    monkeypatch.setattr(nf, "PATTERNS", ("weight",))
+    model = [torch.nn.Sequential(norm)]
+    r0 = float(norm.weight.detach().pow(2).mean().sqrt())
+    nf.setup(model)
+    with torch.no_grad():
+        ref.weight.copy_(norm.weight)
+    assert torch.allclose(norm(x), ref(x), atol=1e-6)          # at the start: unchanged
+    with torch.no_grad():
+        norm.weight.mul_(3.0)                                   # size of v does not matter
+    assert torch.allclose(norm(x), ref(x), atol=1e-5)
+    (norm(x) * torch.randn(8, 64, device="cuda")).sum().backward()
+    g, v = norm.weight.grad, norm.weight.detach()
+    assert abs(float((g * v).sum())) < 1e-4 * float(g.norm() * v.norm())   # orthogonal to v
+    eff = nf.effective(norm.weight.detach(), r0)
+    assert abs(float(eff.pow(2).mean().sqrt()) - r0) < 1e-6

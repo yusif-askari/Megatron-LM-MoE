@@ -1950,10 +1950,12 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     save_wgrads_in_this_iteration = (args.save_wgrads_interval is not None and
                                      (iteration + 1) % args.save_wgrads_interval == 0)
     grad_norm = None
-    from megatron.core import norm_freeze, scale_probe
+    from megatron.core import norm_fixed_rms, norm_freeze, scale_probe
 
     if norm_freeze.ENABLED and not norm_freeze._FROZEN:  # experiment: keep the loaded norm weights
         norm_freeze.setup(model, optimizer)
+    if norm_fixed_rms.ENABLED and not norm_fixed_rms._DONE:  # experiment: norm weights of fixed size
+        norm_fixed_rms.setup(model, args.save)
 
     if scale_probe.PROBE_DIR:  # debug: finite-difference vs gradient probe on norm weights, then stop
         pp_seq_length, pp_micro_batch_size = _pipeline_shape_args(args)
