@@ -378,7 +378,10 @@ def test_pass_only_switch(recipe, monkeypatch):
     y_f, dx_f, dw_f = run("fwd")
     y_b, dx_b, dw_b = run("bwd")
     y_ex, dx_ex, dw_ex = x @ w.t(), dy @ w, dy.t() @ x
-    assert torch.equal(y_f, y_q) and torch.equal(dx_f, dx_ex) and torch.equal(dw_f, dw_ex)
+    assert torch.equal(y_f, y_q) and torch.equal(dx_f, dx_ex)
+    # alto rotates the wgrad operands along tokens: exact in math, not bit-exact in bf16
+    rel = float((dw_f.float() - dw_ex.float()).norm() / dw_ex.float().norm())
+    assert rel == 0 if recipe == "plain" else rel < 1e-2, rel
     assert torch.equal(y_b, y_ex) and not torch.equal(dx_b, dx_ex) and not torch.equal(dw_b, dw_ex)
     if recipe == "plain":                    # no stochastic rounding: bwd matches the full path
         assert torch.equal(dx_b, dx_q) and torch.equal(dw_b, dw_q)
