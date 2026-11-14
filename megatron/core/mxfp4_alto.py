@@ -27,6 +27,11 @@ from megatron.core import mxfp4_emulation as emu
 
 _ALTO = None
 ALIGN = 128          # rows per expert segment in ALTO's grouped layout
+# Gradient-accumulation fusion, as TE's linears do under Megatron's (default) --gradient-accumulation-fusion:
+# the wgrad GEMMs add their fp32 result directly into the weights' main_grad instead of returning a bf16 dW
+# that is then copied and added per expert. MXFP4_WGRAD_ACCUM=0: the previous path (bf16 dW + add).
+WGRAD_ACCUM = os.environ.get("MXFP4_WGRAD_ACCUM", "1") == "1"
+_PTRS = {}
 
 
 def _sr() -> bool:
@@ -54,9 +59,14 @@ def _alto():
         from alto.kernels.fp4.mxfp4.mxfp_linear import MXFP4LinearFunction
         from alto.kernels.hadamard_transform.transform import HadamardTransform
 
+        from alto.kernels.fp4.mxfp4 import mxfp_linear
+        from alto.kernels.fp4.mxfp4.mxfp_grouped_gemm.wgrad_segmented import wgrad_accumulate
+
         assert mxfp_grouped_gemm.ALIGN_SIZE_M == ALIGN, mxfp_grouped_gemm.ALIGN_SIZE_M
+        mxfp_linear.WGRAD_INTO_MAIN_GRAD = WGRAD_ACCUM       # dense linears: wgrad GEMM adds into main_grad
         _ALTO = types.SimpleNamespace(ops=ops, dual_quantize=dual_quantize, wcache=mxfp_weight_cache,
-                                      Linear=MXFP4LinearFunction, HadamardTransform=HadamardTransform)
+                                      Linear=MXFP4LinearFunction, HadamardTransform=HadamardTransform,
+                                      wgrad_accumulate=wgrad_accumulate)
     return _ALTO
 
 
@@ -174,12 +184,42 @@ class _AltoGroupedLinear(torch.autograd.Function):
                 k_pack_w=False, output_dtype=ctx.dtype,
                 **(dict(out_rows=rows, out_len=dy.shape[0]) if ctx.row_map else {}))
             dx = dxp if ctx.row_map else dxp.index_select(0, rows)
-        dw = A.ops.mxfp4_grouped_gemm_backward_weights(
-            grad_output=dyq_t, inputs=xq_t, expert_indices=idx, num_experts=ctx.n_experts,
-            go_scales=dys_t, input_scales=xs_t, trans_weights=True, use_2dblock_go=False,
-            use_2dblock_x=False, k_pack_go=True, k_pack_x=True, output_dtype=ctx.dtype)
-        grads = [emu._accumulate_wgrad(w, dw[e]) for e, w in enumerate(weights)]
+        grads = _grouped_wgrad(dyq_t, dys_t, xq_t, xs_t, idx, weights, ctx.dtype)
         return (dx, None, *grads)
+
+
+def _main_grad_ok(weights):
+    w0 = weights[0]
+    if not (hasattr(w0, "main_grad") and getattr(w0, "grad_added_to_main_grad", None) is not None):
+        return False
+    mg0 = w0.main_grad
+    return all(hasattr(w, "main_grad") and getattr(w, "grad_added_to_main_grad", None) is not None
+               and w.main_grad.shape == w.shape == mg0.shape and w.main_grad.stride() == mg0.stride()
+               and w.main_grad.dtype == mg0.dtype for w in weights) and mg0.dtype in (torch.float32,
+                                                                                  torch.bfloat16)
+
+
+def _grouped_wgrad(go_t, go_s, x_t, x_s, idx, weights, dtype):
+    """Weight gradients of the local experts: dW[e] = Q(H·dy)_eᵀ · Q(H·x)_e (ALTO's grouped wgrad), returned
+    as the autograd grads of `weights`. With WGRAD_ACCUM and Megatron's main_grad, the kernel adds its fp32
+    result into every expert's main_grad in place and the returned grads are placeholders (fresh, so
+    autograd's AccumulateGrad takes them without a copy; DDP skips them: grad_added_to_main_grad)."""
+    A = _alto()
+    if WGRAD_ACCUM and _main_grad_ok(weights):
+        ptrs = tuple(w.main_grad.data_ptr() for w in weights)
+        t = _PTRS.get(ptrs)
+        if t is None:
+            t = _PTRS[ptrs] = torch.tensor(ptrs, dtype=torch.int64, device=go_t.device)
+        A.wgrad_accumulate(go_t, x_t, idx, go_s, x_s, t, weights[0].main_grad)
+        for w in weights:
+            w.grad_added_to_main_grad = True
+        return list(torch.empty((len(weights), *weights[0].shape), dtype=weights[0].dtype,
+                                device=go_t.device).unbind(0))
+    dw = A.ops.mxfp4_grouped_gemm_backward_weights(
+        grad_output=go_t, inputs=x_t, expert_indices=idx, num_experts=len(weights), go_scales=go_s,
+        input_scales=x_s, trans_weights=True, use_2dblock_go=False, use_2dblock_x=False, k_pack_go=True,
+        k_pack_x=True, output_dtype=dtype)
+    return [emu._accumulate_wgrad(w, dw[e]) for e, w in enumerate(weights)]
 
 
 def grouped_linear(x, m_splits, weights):
@@ -279,8 +319,6 @@ class _AltoFusedSwiGLUMLP(torch.autograd.Function):
         h = _h_bf16(dout.device)
         gemm = dict(trans_weights=True, use_2dblock_x=False, use_2dblock_w=True, k_pack_w=False,
                     output_dtype=ctx.dtype)
-        wg = dict(trans_weights=True, use_2dblock_go=False, use_2dblock_x=False, k_pack_go=True,
-                  k_pack_x=True, output_dtype=ctx.dtype)
         rm = ctx.row_map                   # rows = src map (token of each grouped row) if rm, else token -> row
         src = rows if rm else None
         # fc2
@@ -290,9 +328,7 @@ class _AltoFusedSwiGLUMLP(torch.autograd.Function):
         else:
             dp = _scatter_rows(dout.contiguous(), rows, ctx.tp)
             dq, ds, dq_t, ds_t = A.dual_quantize(dp, h, use_sr=_sr(), blockscale_selection="default")
-        dw2 = A.ops.mxfp4_grouped_gemm_backward_weights(
-            grad_output=dq_t, inputs=hq_t, expert_indices=idx, num_experts=len(w2), go_scales=ds_t,
-            input_scales=hs_t, **wg)
+        grads2 = _grouped_wgrad(dq_t, ds_t, hq_t, hs_t, idx, w2, ctx.dtype)
         if FUSED_SWIGLU_BWD:
             # fc2 dgrad -> weighted SwiGLU backward -> Q_sr(dy1), Q_sr(H dy1) in one kernel
             from alto.kernels.fp4.mxfp4.mxfp_grouped_gemm.fused_swiglu import fc2_dgrad_swiglu_bwd
@@ -321,13 +357,10 @@ class _AltoFusedSwiGLUMLP(torch.autograd.Function):
                 expert_weight_scales=w1s, **gemm,
                 **(dict(out_rows=src, out_len=dout.shape[0]) if rm else {}))
             dx = dxp if rm else dxp.index_select(0, rows)
-        dw1 = A.ops.mxfp4_grouped_gemm_backward_weights(
-            grad_output=gq_t, inputs=xq_t, expert_indices=idx, num_experts=len(w1), go_scales=gs_t,
-            input_scales=xs_t, **wg)
+        grads1 = _grouped_wgrad(gq_t, gs_t, xq_t, xs_t, idx, w1, ctx.dtype)
         dpp = dpp.reshape(-1)
         dprobs = (dpp if rm else dpp.index_select(0, rows)).reshape(ctx.p_shape).to(ctx.p_dtype)
-        grads = [emu._accumulate_wgrad(w, dw1[e]) for e, w in enumerate(w1)]
-        grads += [emu._accumulate_wgrad(w, dw2[e]) for e, w in enumerate(w2)]
+        grads = grads1 + grads2
         return (dx, dprobs, None, None, *grads)
 
 
