@@ -192,6 +192,8 @@ def linear(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
 
 # ---- routed-expert MLP with fc1 + SwiGLU + fc2-input quantization fused (forward) -----------
 FUSED_SWIGLU = os.environ.get("MXFP4_FUSED_SWIGLU", "1") == "1"
+# backward of the fused MLP: fc2 dgrad + weighted SwiGLU backward + fc1 gradient quantization in one kernel
+FUSED_SWIGLU_BWD = os.environ.get("MXFP4_FUSED_SWIGLU_BWD", "1") == "1"
 
 
 def _stack_tile(weights, tag):
@@ -246,17 +248,23 @@ class _AltoFusedSwiGLUMLP(torch.autograd.Function):
         # fc2
         dp = _scatter_rows(dout.contiguous(), rows, ctx.tp)
         dq, ds, dq_t, ds_t = A.dual_quantize(dp, h, use_sr=_sr(), blockscale_selection="default")
-        dh = A.ops.mxfp4_grouped_gemm_backward_inputs(
-            grad_output=dq, expert_weights=w2q, expert_indices=idx, go_scales=ds,
-            expert_weight_scales=w2s, **gemm)
         dw2 = A.ops.mxfp4_grouped_gemm_backward_weights(
             grad_output=dq_t, inputs=hq_t, expert_indices=idx, num_experts=len(w2), go_scales=ds_t,
             input_scales=hs_t, **wg)
-        # weighted SwiGLU (Megatron's backward on the saved bf16 y1 and the probs)
-        dy1, dpp = weighted_swiglu_back(dh, y1, pp.unsqueeze(-1))
+        if FUSED_SWIGLU_BWD:
+            # fc2 dgrad -> weighted SwiGLU backward -> Q_sr(dy1), Q_sr(H dy1) in one kernel
+            from alto.kernels.fp4.mxfp4.mxfp_grouped_gemm.fused_swiglu import fc2_dgrad_swiglu_bwd
+
+            gq, gs, gq_t, gs_t, dpp = fc2_dgrad_swiglu_bwd(dq, ds, w2q, w2s, idx, y1, pp, h, use_sr=_sr())
+        else:
+            dh = A.ops.mxfp4_grouped_gemm_backward_inputs(
+                grad_output=dq, expert_weights=w2q, expert_indices=idx, go_scales=ds,
+                expert_weight_scales=w2s, **gemm)
+            # weighted SwiGLU (Megatron's backward on the saved bf16 y1 and the probs)
+            dy1, dpp = weighted_swiglu_back(dh, y1, pp.unsqueeze(-1))
+            gq, gs, gq_t, gs_t = A.dual_quantize(dy1.contiguous(), h, use_sr=_sr(),
+                                                 blockscale_selection="default")
         # fc1
-        gq, gs, gq_t, gs_t = A.dual_quantize(dy1.contiguous(), h, use_sr=_sr(),
-                                             blockscale_selection="default")
         dx = None
         if ctx.needs_input_grad[0]:
             dxp = A.ops.mxfp4_grouped_gemm_backward_inputs(
