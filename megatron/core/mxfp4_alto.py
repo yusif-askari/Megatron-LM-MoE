@@ -107,6 +107,21 @@ def _scatter_rows(x, rows, tp):
     return x.new_zeros(tp, x.shape[1]).index_copy_(0, rows, x)
 
 
+# The padded layout without padded tensors: the kernels that read Megatron's bf16 tensors (the dual
+# quantization of x and dout, the probs in the fused SwiGLU) gather rows on load, and the GEMMs whose bf16
+# results go back to Megatron (fc2 forward, fc1 dgrad, d(probs)) scatter rows on store, through
+# src[m] = token of grouped row m (-1: padding). Only ALTO-internal tensors (FP4 operands, y1) keep the
+# padded rows. MXFP4_ROW_MAP=0: scatter to / gather from padded bf16 copies as before (same results).
+ROW_MAP = os.environ.get("MXFP4_ROW_MAP", "1") == "1"
+
+
+def _src_rows(rows, tp):
+    """Inverse of the layout's row map: token index of every grouped row, -1 on padding rows [Tp] int32."""
+    n = rows.shape[0]
+    return torch.full((tp,), -1, dtype=torch.int32, device=rows.device).index_copy_(
+        0, rows, torch.arange(n, dtype=torch.int32, device=rows.device))
+
+
 class _AltoGroupedLinear(torch.autograd.Function):
     """y[e] = Q(x[e]) · Q(W_e)ᵀ over the local experts' token segments, on ALTO's kernels."""
 
@@ -117,10 +132,14 @@ class _AltoGroupedLinear(torch.autograd.Function):
         assert x.shape[0] == sum(m_splits), (x.shape, sum(m_splits))
         x = x.contiguous()
         rows, idx, tp = _layout(m_splits, x.device)
-        xp = _scatter_rows(x, rows, tp)
+        src = _src_rows(rows, tp) if ROW_MAP else None
         h = _h_bf16(x.device)
         # x along K for the forward GEMM and Q(H·x) along tokens for the wgrad, in one pass
-        xq, xs, xq_t, xs_t = A.dual_quantize(xp, h, use_sr=False, blockscale_selection="default")
+        if ROW_MAP:
+            xq, xs, xq_t, xs_t = A.dual_quantize(x, h, use_sr=False, blockscale_selection="default", src_rows=src)
+        else:
+            xp = _scatter_rows(x, rows, tp)
+            xq, xs, xq_t, xs_t = A.dual_quantize(xp, h, use_sr=False, blockscale_selection="default")
         # stacked weights [E, N, K] and their 32x32-tile quantization, once per training step
         # (keyed by the first weight's identity, as the emulation; the cache keeps the stack
         # alive, so ALTO's own data_ptr-keyed cache cannot confuse two layers' stacks)
@@ -129,26 +148,32 @@ class _AltoGroupedLinear(torch.autograd.Function):
             w, axis=-1, is_2d_block=True, blockscale_selection="default"))
         yp = A.ops.mxfp4_grouped_gemm_forward(
             inputs=xq, expert_weights=wq, expert_indices=idx, input_scales=xs, weight_scales=ws,
-            trans_weights=True, use_2dblock_x=False, use_2dblock_w=True, output_dtype=x.dtype)
-        ctx.save_for_backward(xq_t, xs_t, wq, ws, idx, rows, *weights)
-        ctx.tp, ctx.n_experts, ctx.dtype = tp, len(weights), x.dtype
-        return yp.index_select(0, rows)
+            trans_weights=True, use_2dblock_x=False, use_2dblock_w=True, output_dtype=x.dtype,
+            **(dict(out_rows=src, out_len=x.shape[0]) if ROW_MAP else {}))
+        ctx.save_for_backward(xq_t, xs_t, wq, ws, idx, src if ROW_MAP else rows, *weights)
+        ctx.tp, ctx.n_experts, ctx.dtype, ctx.row_map = tp, len(weights), x.dtype, ROW_MAP
+        return yp if ROW_MAP else yp.index_select(0, rows)
 
     @staticmethod
     def backward(ctx, dy):
         A = _alto()
-        xq_t, xs_t, wq, ws, idx, rows, *weights = ctx.saved_tensors
-        dyp = _scatter_rows(dy.contiguous(), rows, ctx.tp)
+        xq_t, xs_t, wq, ws, idx, rows, *weights = ctx.saved_tensors      # rows: src map if ctx.row_map
         h = _h_bf16(dy.device)
         # dy along N (dgrad) and Q_sr(H·dy) along tokens (wgrad), both stochastically rounded
-        dyq, dys, dyq_t, dys_t = A.dual_quantize(dyp, h, use_sr=_sr(), blockscale_selection="default")
+        if ctx.row_map:
+            dyq, dys, dyq_t, dys_t = A.dual_quantize(dy.contiguous(), h, use_sr=_sr(),
+                                                     blockscale_selection="default", src_rows=rows)
+        else:
+            dyp = _scatter_rows(dy.contiguous(), rows, ctx.tp)
+            dyq, dys, dyq_t, dys_t = A.dual_quantize(dyp, h, use_sr=_sr(), blockscale_selection="default")
         dx = None
         if ctx.needs_input_grad[0]:
             dxp = A.ops.mxfp4_grouped_gemm_backward_inputs(
                 grad_output=dyq, expert_weights=wq, expert_indices=idx, go_scales=dys,
                 expert_weight_scales=ws, trans_weights=True, use_2dblock_x=False, use_2dblock_w=True,
-                k_pack_w=False, output_dtype=ctx.dtype)
-            dx = dxp.index_select(0, rows)
+                k_pack_w=False, output_dtype=ctx.dtype,
+                **(dict(out_rows=rows, out_len=dy.shape[0]) if ctx.row_map else {}))
+            dx = dxp if ctx.row_map else dxp.index_select(0, rows)
         dw = A.ops.mxfp4_grouped_gemm_backward_weights(
             grad_output=dyq_t, inputs=xq_t, expert_indices=idx, num_experts=ctx.n_experts,
             go_scales=dys_t, input_scales=xs_t, trans_weights=True, use_2dblock_go=False,
@@ -219,19 +244,30 @@ class _AltoFusedSwiGLUMLP(torch.autograd.Function):
         w1, w2 = weights[:n_fc1], weights[n_fc1:]
         x = x.contiguous()
         rows, idx, tp = _layout(m_splits, x.device)
-        xp = _scatter_rows(x, rows, tp)
-        pp = torch.zeros(tp, dtype=probs.dtype, device=x.device).index_copy_(0, rows, probs.reshape(-1))
         h = _h_bf16(x.device)
-        xq, xs, xq_t, xs_t = A.dual_quantize(xp, h, use_sr=False, blockscale_selection="default")
+        if ROW_MAP:
+            # no padded copies: the kernels read x and probs through src, fc2 writes out in token order
+            src = _src_rows(rows, tp)
+            pp = probs.reshape(-1).contiguous()
+            xq, xs, xq_t, xs_t = A.dual_quantize(x, h, use_sr=False, blockscale_selection="default",
+                                                 src_rows=src)
+        else:
+            src = None
+            xp = _scatter_rows(x, rows, tp)
+            pp = torch.zeros(tp, dtype=probs.dtype, device=x.device).index_copy_(0, rows, probs.reshape(-1))
+            xq, xs, xq_t, xs_t = A.dual_quantize(xp, h, use_sr=False, blockscale_selection="default")
         w1q, w1s = _stack_tile(w1, "fc1")
-        y1, hq, hs, hq_t, hs_t = fc1_swiglu_quant(xq, xs, w1q, w1s, idx, pp, h)
+        y1, hq, hs, hq_t, hs_t = fc1_swiglu_quant(xq, xs, w1q, w1s, idx, pp, h, src_rows=src)
         w2q, w2s = _stack_tile(w2, "fc2")
         outp = A.ops.mxfp4_grouped_gemm_forward(
             inputs=hq, expert_weights=w2q, expert_indices=idx, input_scales=hs, weight_scales=w2s,
-            trans_weights=True, use_2dblock_x=False, use_2dblock_w=True, output_dtype=x.dtype)
-        ctx.save_for_backward(xq_t, xs_t, w1q, w1s, y1, pp, hq_t, hs_t, w2q, w2s, idx, rows, *weights)
+            trans_weights=True, use_2dblock_x=False, use_2dblock_w=True, output_dtype=x.dtype,
+            **(dict(out_rows=src, out_len=x.shape[0]) if ROW_MAP else {}))
+        ctx.save_for_backward(xq_t, xs_t, w1q, w1s, y1, pp, hq_t, hs_t, w2q, w2s, idx,
+                              src if ROW_MAP else rows, *weights)
         ctx.tp, ctx.n_fc1, ctx.dtype, ctx.p_shape, ctx.p_dtype = tp, n_fc1, x.dtype, probs.shape, probs.dtype
-        return outp.index_select(0, rows)
+        ctx.row_map = ROW_MAP
+        return outp if ROW_MAP else outp.index_select(0, rows)
 
     @staticmethod
     def backward(ctx, dout):
@@ -245,9 +281,15 @@ class _AltoFusedSwiGLUMLP(torch.autograd.Function):
                     output_dtype=ctx.dtype)
         wg = dict(trans_weights=True, use_2dblock_go=False, use_2dblock_x=False, k_pack_go=True,
                   k_pack_x=True, output_dtype=ctx.dtype)
+        rm = ctx.row_map                   # rows = src map (token of each grouped row) if rm, else token -> row
+        src = rows if rm else None
         # fc2
-        dp = _scatter_rows(dout.contiguous(), rows, ctx.tp)
-        dq, ds, dq_t, ds_t = A.dual_quantize(dp, h, use_sr=_sr(), blockscale_selection="default")
+        if rm:
+            dq, ds, dq_t, ds_t = A.dual_quantize(dout.contiguous(), h, use_sr=_sr(),
+                                                 blockscale_selection="default", src_rows=src)
+        else:
+            dp = _scatter_rows(dout.contiguous(), rows, ctx.tp)
+            dq, ds, dq_t, ds_t = A.dual_quantize(dp, h, use_sr=_sr(), blockscale_selection="default")
         dw2 = A.ops.mxfp4_grouped_gemm_backward_weights(
             grad_output=dq_t, inputs=hq_t, expert_indices=idx, num_experts=len(w2), go_scales=ds_t,
             input_scales=hs_t, **wg)
@@ -255,13 +297,20 @@ class _AltoFusedSwiGLUMLP(torch.autograd.Function):
             # fc2 dgrad -> weighted SwiGLU backward -> Q_sr(dy1), Q_sr(H dy1) in one kernel
             from alto.kernels.fp4.mxfp4.mxfp_grouped_gemm.fused_swiglu import fc2_dgrad_swiglu_bwd
 
-            gq, gs, gq_t, gs_t, dpp = fc2_dgrad_swiglu_bwd(dq, ds, w2q, w2s, idx, y1, pp, h, use_sr=_sr())
+            gq, gs, gq_t, gs_t, dpp = fc2_dgrad_swiglu_bwd(dq, ds, w2q, w2s, idx, y1, pp, h, use_sr=_sr(),
+                                                           src_rows=src)
         else:
+            if rm:                         # Megatron's backward works on the padded rows: padded probs
+                pp = torch.zeros(ctx.tp, dtype=pp.dtype, device=pp.device).index_copy_(
+                    0, (src >= 0).nonzero().squeeze(1), pp.index_select(0, src[src >= 0].long()))
             dh = A.ops.mxfp4_grouped_gemm_backward_inputs(
                 grad_output=dq, expert_weights=w2q, expert_indices=idx, go_scales=ds,
                 expert_weight_scales=w2s, **gemm)
             # weighted SwiGLU (Megatron's backward on the saved bf16 y1 and the probs)
             dy1, dpp = weighted_swiglu_back(dh, y1, pp.unsqueeze(-1))
+            if rm:
+                dpp = dpp.reshape(-1)[src >= 0].new_zeros(dout.shape[0]).index_copy_(
+                    0, src[src >= 0].long(), dpp.reshape(-1)[src >= 0])
             gq, gs, gq_t, gs_t = A.dual_quantize(dy1.contiguous(), h, use_sr=_sr(),
                                                  blockscale_selection="default")
         # fc1
@@ -269,12 +318,14 @@ class _AltoFusedSwiGLUMLP(torch.autograd.Function):
         if ctx.needs_input_grad[0]:
             dxp = A.ops.mxfp4_grouped_gemm_backward_inputs(
                 grad_output=gq, expert_weights=w1q, expert_indices=idx, go_scales=gs,
-                expert_weight_scales=w1s, **gemm)
-            dx = dxp.index_select(0, rows)
+                expert_weight_scales=w1s, **gemm,
+                **(dict(out_rows=src, out_len=dout.shape[0]) if rm else {}))
+            dx = dxp if rm else dxp.index_select(0, rows)
         dw1 = A.ops.mxfp4_grouped_gemm_backward_weights(
             grad_output=gq_t, inputs=xq_t, expert_indices=idx, num_experts=len(w1), go_scales=gs_t,
             input_scales=xs_t, **wg)
-        dprobs = dpp.reshape(-1).index_select(0, rows).reshape(ctx.p_shape).to(ctx.p_dtype)
+        dpp = dpp.reshape(-1)
+        dprobs = (dpp if rm else dpp.index_select(0, rows)).reshape(ctx.p_shape).to(ctx.p_dtype)
         grads = [emu._accumulate_wgrad(w, dw1[e]) for e, w in enumerate(w1)]
         grads += [emu._accumulate_wgrad(w, dw2[e]) for e, w in enumerate(w2)]
         return (dx, dprobs, None, None, *grads)
