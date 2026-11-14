@@ -44,6 +44,7 @@ def run(kind, accum, x, m, p, w1, w2, dout, init):
     xs = x.detach().clone().requires_grad_()
     ps = p.detach().clone().requires_grad_()
     a, b = with_main_grad(w1, init), with_main_grad(w2, init)
+    T._KEEP.extend(a + b)        # the per-step weight caches are keyed by id(): keep the copies alive
     if kind == "fused":
         out = mxfp4_alto.fused_swiglu_mlp(xs, m, ps, a, b)
     elif kind == "unfused":

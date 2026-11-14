@@ -37,6 +37,9 @@ class _Bf16Grouped(torch.autograd.Function):
         return torch._grouped_mm(dy, w, offs=offs), torch._grouped_mm(dy.t(), x, offs=offs), None
 
 
+_KEEP = []
+
+
 def bf16_torch(x, m, p, w1s, w2s, offs):
     """bf16 baseline: torch._grouped_mm fc1, Megatron's weighted SwiGLU, fc2."""
     return _Bf16Grouped.apply(weighted_bias_swiglu_impl(_Bf16Grouped.apply(x, w1s, offs), None, p), w2s, offs)
@@ -90,6 +93,7 @@ def run(fn, backend, x, m, p, w1, w2, dout):
     ps = p.detach().clone().requires_grad_()
     w1s = [w.detach().clone().requires_grad_() for w in w1]
     w2s = [w.detach().clone().requires_grad_() for w in w2]
+    _KEEP.extend(w1s + w2s)      # the per-step weight caches are keyed by id(): keep the copies alive
     out = fn(xs, m, ps, w1s, w2s)
     out.backward(dout)
     return {"out": out.detach(), "dx": xs.grad, "dprobs": ps.grad,

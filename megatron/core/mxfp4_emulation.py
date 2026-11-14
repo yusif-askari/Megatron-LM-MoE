@@ -501,4 +501,10 @@ def apply_to_model(model, rule: str, recipe: str = "plain", skip=()) -> list:
     unmatched = [k for k in skip if k not in matched]
     if unmatched:
         raise ValueError(f"--mxfp4-skip: no TE linear in the decoder matches {unmatched}")
+    if BACKEND == "alto":
+        # shared expert / dense MLP: fc1 -> SwiGLU -> fc2 on the fused kernels (as the routed experts)
+        from megatron.core import mxfp4_alto
+
+        fused = mxfp4_alto.fuse_dense_mlps(decoder, patched)
+        patched = patched + [f"{n} (fused SwiGLU MLP)" for n in fused]
     return patched

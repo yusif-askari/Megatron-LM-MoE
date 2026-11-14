@@ -113,6 +113,20 @@ def _layout(m_splits, device):
     return rows, idx, tp
 
 
+_IDX0 = {}
+
+
+def _idx_unpadded(m_splits, device):
+    """Expert index of every row when no segment needs padding (all multiples of 128)."""
+    if len(m_splits) == 1:            # shared expert / dense MLP: one expert, cached
+        key = (m_splits[0], torch.device(device))
+        if key not in _IDX0:
+            _IDX0[key] = torch.zeros(m_splits[0], dtype=torch.int32, device=device)
+        return _IDX0[key]
+    return torch.repeat_interleave(torch.arange(len(m_splits), device=device, dtype=torch.int32),
+                                   emu._to_device(m_splits, device, torch.int64), output_size=sum(m_splits))
+
+
 def _scatter_rows(x, rows, tp):
     return x.new_zeros(tp, x.shape[1]).index_copy_(0, rows, x)
 
@@ -205,6 +219,18 @@ def _grouped_wgrad(go_t, go_s, x_t, x_s, idx, weights, dtype):
     result into every expert's main_grad in place and the returned grads are placeholders (fresh, so
     autograd's AccumulateGrad takes them without a copy; DDP skips them: grad_added_to_main_grad)."""
     A = _alto()
+    if len(weights) == 1:
+        # one expert (shared expert, dense MLP): the dense MXFP4 wgrad GEMM (the kernel the unfused dense path
+        # uses); the grouped kernel parallelises over experts and would run few programs over all tokens
+        from alto.kernels.fp4.mxfp4.mxfp_linear import blockwise_mxfp4_gemm_accumulate_
+
+        w = weights[0]
+        if WGRAD_ACCUM and _main_grad_ok(weights):
+            blockwise_mxfp4_gemm_accumulate_(go_t, go_s, x_t, x_s, w.main_grad)
+            w.grad_added_to_main_grad = True
+            return [torch.empty_like(w)]
+        dw = A.ops.blockwise_mxfp4_gemm(go_t, go_s, x_t, x_s, trans_a=True, output_dtype=dtype)
+        return [emu._accumulate_wgrad(w, dw)]
     if WGRAD_ACCUM and _main_grad_ok(weights):
         ptrs = tuple(w.main_grad.data_ptr() for w in weights)
         t = _PTRS.get(ptrs)
@@ -283,9 +309,23 @@ class _AltoFusedSwiGLUMLP(torch.autograd.Function):
         m_splits = list(m_splits)
         w1, w2 = weights[:n_fc1], weights[n_fc1:]
         x = x.contiguous()
-        rows, idx, tp = _layout(m_splits, x.device)
+        # segments already 128-aligned (e.g. the shared expert / dense MLP: one expert, 16384 tokens):
+        # the grouped layout is the token order itself, no maps and no copies
+        nopad = all(m % ALIGN == 0 for m in m_splits)
+        if nopad:
+            rows, idx, tp = None, _idx_unpadded(m_splits, x.device), x.shape[0]
+        else:
+            rows, idx, tp = _layout(m_splits, x.device)
+        use_map = ROW_MAP and not nopad
         h = _h_bf16(x.device)
-        if ROW_MAP:
+        weighted = probs is not None
+        if not weighted:      # plain SwiGLU (shared expert, dense MLP): p = 1 (h = silu(g) v exactly)
+            probs = _ones(x.shape[0], x.device)
+        if nopad:
+            src = None
+            pp = probs.reshape(-1).contiguous()
+            xq, xs, xq_t, xs_t = A.dual_quantize(x, h, use_sr=False, blockscale_selection="default")
+        elif use_map:
             # no padded copies: the kernels read x and probs through src, fc2 writes out in token order
             src = _src_rows(rows, tp)
             pp = probs.reshape(-1).contiguous()
@@ -302,12 +342,12 @@ class _AltoFusedSwiGLUMLP(torch.autograd.Function):
         outp = A.ops.mxfp4_grouped_gemm_forward(
             inputs=hq, expert_weights=w2q, expert_indices=idx, input_scales=hs, weight_scales=w2s,
             trans_weights=True, use_2dblock_x=False, use_2dblock_w=True, output_dtype=x.dtype,
-            **(dict(out_rows=src, out_len=x.shape[0]) if ROW_MAP else {}))
+            **(dict(out_rows=src, out_len=x.shape[0]) if use_map else {}))
         ctx.save_for_backward(xq_t, xs_t, w1q, w1s, y1, pp, hq_t, hs_t, w2q, w2s, idx,
-                              src if ROW_MAP else rows, *weights)
+                              src if use_map else rows, *weights)
         ctx.tp, ctx.n_fc1, ctx.dtype, ctx.p_shape, ctx.p_dtype = tp, n_fc1, x.dtype, probs.shape, probs.dtype
-        ctx.row_map = ROW_MAP
-        return outp if ROW_MAP else outp.index_select(0, rows)
+        ctx.row_map, ctx.nopad, ctx.weighted = use_map, nopad, weighted
+        return outp if (use_map or nopad) else outp.index_select(0, rows)
 
     @staticmethod
     def backward(ctx, dout):
@@ -321,8 +361,12 @@ class _AltoFusedSwiGLUMLP(torch.autograd.Function):
                     output_dtype=ctx.dtype)
         rm = ctx.row_map                   # rows = src map (token of each grouped row) if rm, else token -> row
         src = rows if rm else None
+        direct = rm or ctx.nopad           # results already in token order
         # fc2
-        if rm:
+        if ctx.nopad:
+            dq, ds, dq_t, ds_t = A.dual_quantize(dout.contiguous(), h, use_sr=_sr(),
+                                                 blockscale_selection="default")
+        elif rm:
             dq, ds, dq_t, ds_t = A.dual_quantize(dout.contiguous(), h, use_sr=_sr(),
                                                  blockscale_selection="default", src_rows=src)
         else:
@@ -356,12 +400,78 @@ class _AltoFusedSwiGLUMLP(torch.autograd.Function):
                 grad_output=gq, expert_weights=w1q, expert_indices=idx, go_scales=gs,
                 expert_weight_scales=w1s, **gemm,
                 **(dict(out_rows=src, out_len=dout.shape[0]) if rm else {}))
-            dx = dxp if rm else dxp.index_select(0, rows)
+            dx = dxp if direct else dxp.index_select(0, rows)
         grads1 = _grouped_wgrad(gq_t, gs_t, xq_t, xs_t, idx, w1, ctx.dtype)
-        dpp = dpp.reshape(-1)
-        dprobs = (dpp if rm else dpp.index_select(0, rows)).reshape(ctx.p_shape).to(ctx.p_dtype)
+        dprobs = None
+        if ctx.weighted:
+            dpp = dpp.reshape(-1)
+            dprobs = (dpp if direct else dpp.index_select(0, rows)).reshape(ctx.p_shape).to(ctx.p_dtype)
         grads = grads1 + grads2
         return (dx, dprobs, None, None, *grads)
+
+
+_ONES = {}
+
+
+def _ones(n, device):
+    key = (n, torch.device(device))
+    if key not in _ONES:
+        _ONES[key] = torch.ones(n, dtype=torch.float32, device=device)
+    return _ONES[key]
+
+
+def fused_swiglu_dense(x, w1, w2):
+    """Dense MLP fc2(SwiGLU(fc1(x))) (shared expert, dense MLP layer) on the fused kernels of the routed
+    MLP, as one expert holding all tokens: x [T, K], w1 [2F, K], w2 [K, F]. Same numerics as the unfused
+    MXFP4 path (MXFP4 linear, Megatron's bias_swiglu_impl, MXFP4 linear)."""
+    return _AltoFusedSwiGLUMLP.apply(x, None, [x.shape[0]], 1, w1, w2)
+
+
+def fuse_dense_mlps(decoder, patched):
+    """--mxfp4-emulate all_linear on this backend: MLP / SharedExpertMLP modules whose fc1 and fc2 are both
+    MXFP4 (names in `patched`) and compute exactly fc1 -> SwiGLU -> fc2 run on fused_swiglu_dense (fc1
+    epilogue: SwiGLU + fc2 input quantization; backward: fc2 dgrad + SwiGLU backward + fc1 gradient
+    quantization). Returns the names of the fused modules."""
+    import types
+
+    import torch.nn.functional as F
+
+    from megatron.core.extensions.transformer_engine import TELayerNormColumnParallelLinear
+    from megatron.core.transformer.mlp import MLP
+    from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
+
+    if not FUSED_SWIGLU:
+        return []
+    names = set(patched)
+    fused = []
+    for name, mod in decoder.named_modules():
+        if not isinstance(mod, MLP) or f"{name}.linear_fc1" not in names or f"{name}.linear_fc2" not in names:
+            continue
+        c = mod.config
+        if not (c.gated_linear_unit and mod.activation_func == F.silu and c.bias_activation_fusion
+                and not c.use_te_activation_func and c.activation_func_clamp_value is None
+                and c.glu_linear_offset == 0.0 and not c.activation_func_fp8_input_store
+                and not (c.cpu_offloading and c.cpu_offloading_activations) and not (c.fp8 or c.fp4)
+                and not c.add_bias_linear):
+            continue
+        norm = isinstance(mod.linear_fc1, TELayerNormColumnParallelLinear)
+        shared = isinstance(mod, SharedExpertMLP)
+
+        def forward(self, hidden_states, per_token_scale=None, _norm=norm, _shared=shared, **kwargs):
+            assert per_token_scale is None, "fused MXFP4 MLP: per_token_scale is not supported"
+            x = emu._fused_norm(self.linear_fc1, hidden_states) if _norm else hidden_states
+            lead = x.shape[:-1]
+            out = fused_swiglu_dense(x.reshape(-1, x.shape[-1]), self.linear_fc1.weight,
+                                     self.linear_fc2.weight).reshape(*lead, -1)
+            if not _shared:
+                return out, None
+            if self.use_shared_expert_gate:
+                out = out * torch.sigmoid(torch.nn.functional.linear(hidden_states, self.gate_weight))
+            return out
+
+        mod.forward = types.MethodType(forward, mod)
+        fused.append(name)
+    return fused
 
 
 def fused_swiglu_mlp(x, m_splits, probs, w1, w2):
