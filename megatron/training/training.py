@@ -1497,6 +1497,28 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     if not isinstance(model, list):
         model = [model]
 
+    if getattr(args, 'mxfp4_emulate', None) is not None:
+        from megatron.core import mxfp4_emulation
+
+        mxfp4_emulation.set_backend(args.mxfp4_backend, args.mxfp4_scale_rule, args.mxfp4_recipe)
+        print_rank_0(f'> MXFP4 GEMMs ({args.mxfp4_emulate}): backend {args.mxfp4_backend}, '
+                     f'recipe {args.mxfp4_recipe}, scale rule {args.mxfp4_scale_rule}')
+    # --mxfp4-emulate all_linear: every TE linear in the decoder (except --mxfp4-skip) runs as an
+    # MXFP4 GEMM (the routed experts are handled inside TEGroupedMLP for both scopes).
+    if getattr(args, 'mxfp4_emulate', None) == 'all_linear':
+        from megatron.core import mxfp4_emulation
+
+        skip = tuple(k for k in (getattr(args, 'mxfp4_skip', None) or '').split(',') if k)
+        for model_module in model:
+            patched = mxfp4_emulation.apply_to_model(
+                model_module, args.mxfp4_scale_rule, args.mxfp4_recipe, skip
+            )
+        print_rank_0(
+            f'> --mxfp4-emulate all_linear ({args.mxfp4_scale_rule}, recipe {args.mxfp4_recipe}'
+            f'{", bf16: " + ",".join(skip) if skip else ""}): {len(patched)} TE linear '
+            f'modules + the routed experts in MXFP4: {", ".join(patched)}'
+        )
+
     # Set tensor model parallel attributes if not set.
     # Only parameters that are already tensor model parallel have these
     # attributes set for them. We should make sure the default attributes
@@ -1991,6 +2013,11 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         nan_debug_new_step(iteration + 1, model)
         activation_norm_logging.reset_attempt()
         output_logit_logging.reset_attempt()
+        if getattr(args, 'mxfp4_emulate', None) is not None:
+            # quantized weights are reused across this step's micro-batches
+            from megatron.core import mxfp4_emulation
+
+            mxfp4_emulation.new_step()
         # Set grad to zero.
         for model_chunk in model:
             model_chunk.zero_grad_buffer()
@@ -2159,6 +2186,10 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     if log_router_update:
         snapshot_router_weights(optimizer)
 
+    if getattr(args, 'mxfp4_emulate', None) is not None:
+        from megatron.core import mxfp4_emulation
+
+        mxfp4_emulation.end_step()  # weights change in the step below
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
     if args.optimizer == 'md_decoupling' and args.check_grad_norm and isinstance(optimizer, LayerWiseDistributedOptimizer):
         update_successful, grad_norm, num_zeros_in_grad = optimizer.step_after_grad_norm(grad_norm)

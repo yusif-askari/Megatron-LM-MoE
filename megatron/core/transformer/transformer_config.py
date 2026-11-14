@@ -300,6 +300,31 @@ class TransformerConfig(ModelParallelConfig):
     yet. Not compatible with ``bias_activation_fusion``, ``use_te_activation_func``, or the
     offloading-experts path."""
 
+    mxfp4_emulate: Optional[Literal['experts', 'all_linear']] = None
+    """MXFP4 GEMMs (megatron/core/mxfp4_emulation.py): every operand is quantized to MXFP4 (blocks
+    of 32 along the GEMM's contraction dim, e8m0 scale, e2m1 elements). ``'experts'``: the routed
+    experts' fc1 and fc2 (forward, dgrad and wgrad). ``'all_linear'``: also every other TE linear
+    inside the decoder except those matched by ``mxfp4_skip``; embedding, output layer and router
+    stay bf16. Needs TEGroupedMLP, TP 1, expert TP 1, bias-free linears, no fp8/fp4 recipe."""
+
+    mxfp4_recipe: Literal['plain', 'alto'] = 'plain'
+    """``'plain'``: round-to-nearest, 1-D blocks along each GEMM's contraction dim. ``'alto'``: AMD
+    ALTO's training recipe: 32x32 weight tiles shared by forward and dgrad, stochastic rounding
+    of the gradient operands, and a random Hadamard rotation along tokens before the wgrad
+    quantization."""
+
+    mxfp4_scale_rule: Literal['floor', 'alto', 'none'] = 'alto'
+    """Block-scale rule. ``'floor'``: OCP spec, e = floor(log2 amax) - 2. ``'alto'``: AMD ALTO's
+    default, the same but one power of two up when amax/s >= 7. ``'none'``: no quantization."""
+
+    mxfp4_skip: Optional[str] = None
+    """Comma-separated substrings of decoder module names that ``all_linear`` leaves in bf16."""
+
+    mxfp4_backend: Literal['emulate', 'alto'] = 'emulate'
+    """``'emulate'``: quantize-dequantize and a bf16 GEMM (any GPU). ``'alto'``: the same GEMMs on
+    AMD ALTO's MXFP4 kernels (gfx950 only; recipe alto with scale rule alto;
+    megatron/core/mxfp4_alto.py, ALTO checkout in $ALTO_DIR)."""
+
     xssglu: bool = False
     """If True, replace the gate of a gated linear unit with the learnable XSSGLU gate:
     ``XSSGLU(x_glu, x_linear) = (|alpha|*softsign(x_glu) + 0.5) * x_glu * x_linear``. Unlike
@@ -1737,6 +1762,20 @@ class TransformerConfig(ModelParallelConfig):
             # all-reduces the feature statistics and the alpha gradients across the relevant
             # tensor-parallel group, so it is correct (and consistent) at any TP/ETP degree. No
             # parallelism restriction is needed.
+
+        if self.mxfp4_emulate is not None:
+            if self.fp8 or self.fp4:
+                raise ValueError("--mxfp4-emulate cannot be combined with --fp8-format/--fp4-format")
+            if self.add_bias_linear:
+                raise ValueError("--mxfp4-emulate supports bias-free linears only")
+            if (self.expert_tensor_parallel_size or 1) != 1:
+                raise ValueError("--mxfp4-emulate needs --expert-tensor-parallel-size 1")
+            if self.mxfp4_skip and self.mxfp4_emulate != 'all_linear':
+                raise ValueError("--mxfp4-skip only applies to --mxfp4-emulate all_linear")
+            if self.mxfp4_emulate == 'all_linear' and self.tensor_model_parallel_size != 1:
+                raise ValueError("--mxfp4-emulate all_linear needs --tensor-model-parallel-size 1")
+            if self.moe_ffn_hidden_size is not None and self.moe_ffn_hidden_size % 32:
+                raise ValueError("--mxfp4-emulate needs moe_ffn_hidden_size % 32 == 0")
 
         # These are all recently-added, not-yet-fused learnable activations sharing the same
         # (narrow) compatibility envelope; they are mutually exclusive with each other.
