@@ -25,6 +25,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from megatron.core.transformer import output_logit_logging
+from megatron.core.fusions import fused_linear_cross_entropy
 from megatron.core.transformer.enums import CudaGraphScope, ModelType
 from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionBlock,
@@ -683,6 +684,27 @@ class GPTModel(LanguageModule):
             output_logit_logging.record_hidden(
                 hidden_states, loss_mask, self.pg_collection.tp,
                 sequence_parallel=self.output_layer.sequence_parallel,
+            )
+
+        # Output layer + cross entropy without the full logits (MEGATRON_FUSED_LINEAR_CE=1): same
+        # loss and gradients as below up to reduction order; only where it computes the same thing.
+        if (
+            self.training
+            and labels is not None
+            and loss_mask is not None
+            and fused_linear_cross_entropy.enabled()
+            and not output_logit_logging.is_active()
+            and not self.config.use_mup
+            and not self.config.mtp_num_layers
+            and self.pg_collection.tp.size() == 1
+            and not self.output_layer.sequence_parallel
+            and getattr(self.output_layer, "bias", None) is None
+            and self.config.cross_entropy_loss_fusion
+            and self.config.cross_entropy_fusion_impl == 'native'
+        ):
+            weight = output_weight if output_weight is not None else self.output_layer.weight
+            return fused_linear_cross_entropy.fused_linear_cross_entropy(
+                hidden_states, weight, labels, loss_mask
             )
 
         logits, _ = self.output_layer(
