@@ -254,3 +254,115 @@ class TestWiring:
             assert _close(of, op), kw.keys()
             for a, b in zip(gf, gp):
                 assert _close(a, b), kw.keys()
+
+
+# ---- exp_pglu wiring (learnable gate: exp_gates.ExpPGLU.weighted_glu) ------------------------------
+class _NoFused(torch.nn.Module):
+    """The same ExpPGLU without weighted_glu: forces the generic GLU path (gate, * x_linear, * prob)."""
+
+    def __init__(self, gate):
+        super().__init__()
+        self.gate = gate
+
+    def forward(self, x, tokens_per_expert=None, expert_ids=None):
+        return self.gate(x, tokens_per_expert, expert_ids)
+
+
+def _pglu_config(**kw):
+    return TransformerConfig(num_layers=1, hidden_size=64, num_attention_heads=4, ffn_hidden_size=96,
+                             add_bias_linear=False, gated_linear_unit=True, activation_func=torch.nn.functional.silu,
+                             exp_learnable_gate="exp_pglu", bias_activation_fusion=False, bf16=True,
+                             params_dtype=torch.bfloat16, **kw)
+
+
+def _run_pglu_both(module, call, params):
+    gate, out = module.exp_gate, {}
+    for tag in ("fused", "plain"):
+        module.exp_gate = gate if tag == "fused" else _NoFused(gate)
+        for prm in params:
+            prm.grad = None
+        o = call()
+        o.float().square().sum().backward()
+        out[tag] = (o.detach(), [prm.grad.clone() for prm in params])
+    module.exp_gate = gate
+    return out
+
+
+@NEED_GPU
+@pytest.mark.skipif(not HAVE_MEGATRON, reason="Megatron not importable")
+class TestPGLUWiring:
+
+    def setup_method(self, method):
+        from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+        torch.manual_seed(0)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @staticmethod
+    def _count(monkeypatch):
+        calls = []
+        orig = meg_eg.ExpPGLU.weighted_glu
+        monkeypatch.setattr(meg_eg.ExpPGLU, "weighted_glu",
+                            lambda s, *a, **k: calls.append(1) or orig(s, *a, **k))
+        return calls
+
+    def test_grouped_mlp(self, monkeypatch):
+        from megatron.core.models.gpt.gpt_layer_specs import (
+            get_gpt_layer_with_transformer_engine_submodules)
+        from megatron.core.transformer.moe.moe_layer import MoELayer
+        cfg = _pglu_config(num_moe_experts=4, moe_grouped_gemm=True, moe_router_topk=2)
+        layer = MoELayer(cfg, get_gpt_layer_with_transformer_engine_submodules(
+            4, moe_grouped_gemm=True).mlp.submodules).cuda()
+        experts = layer.experts
+        with torch.no_grad():
+            experts.exp_gate.raw_p.copy_(torch.tensor([0.5413, -0.3, 1.2, 0.0]))   # p = 1, ...
+            experts.exp_gate.b.copy_(torch.tensor([1.0, 0.0, -0.5, 0.3]))
+        calls = self._count(monkeypatch)
+        tpe = torch.tensor([37, 0, 64, 27])
+        n = int(tpe.sum())
+        x = (torch.randn(n, 64, device="cuda") * 0.5).bfloat16()
+        probs = (torch.rand(n, device="cuda") * 0.9 + 0.05).requires_grad_(True)
+        params = [prm for prm in experts.parameters()] + [probs]
+        res = _run_pglu_both(experts, lambda: experts(x, tokens_per_expert=tpe, permuted_probs=probs)[0],
+                             params)
+        assert len(calls) == 1
+        (of, gf), (op, gp) = res["fused"], res["plain"]
+        assert _close(of, op), "router prob applied a different number of times"
+        for a, b in zip(gf, gp):
+            assert _close(a, b), "gradient mismatch"
+
+    def test_dense_mlp(self, monkeypatch):
+        from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
+        from megatron.core.transformer.mlp import MLP
+        mlp = MLP(_pglu_config(), get_gpt_layer_local_submodules().mlp.submodules).cuda()
+        with torch.no_grad():
+            mlp.exp_gate.raw_p.fill_(0.2)
+            mlp.exp_gate.b.fill_(0.7)
+        calls = self._count(monkeypatch)
+        x = (torch.randn(16, 3, 64, device="cuda") * 0.5).bfloat16()
+        scale = (torch.rand(16, 3, device="cuda") + 0.1).requires_grad_(True)
+        params = [prm for prm in mlp.parameters()]
+        for kw, extra in (({}, []), ({"per_token_scale": scale}, [scale])):
+            calls.clear()
+            res = _run_pglu_both(mlp, lambda: mlp(x, **kw)[0], params + extra)
+            assert len(calls) == 1
+            (of, gf), (op, gp) = res["fused"], res["plain"]
+            assert _close(of, op), kw.keys()
+            for a, b in zip(gf, gp):
+                assert _close(a, b), kw.keys()
+
+    def test_float16module_keeps_fp32(self):
+        from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
+        from megatron.core.transformer.mlp import MLP
+        from megatron.core.transformer.module import Float16Module
+        cfg = _pglu_config()
+        mlp = MLP(cfg, get_gpt_layer_local_submodules().mlp.submodules)
+        with torch.no_grad():
+            mlp.exp_gate.b.fill_(1.0 + 2.0 ** -10)                    # not representable in bf16
+        fm = Float16Module(cfg, mlp)
+        assert fm.module.exp_gate.raw_p.dtype == torch.float32
+        assert fm.module.exp_gate.b.dtype == torch.float32 and fm.module.exp_gate.b[0].item() == 1.0 + 2.0 ** -10
+        assert fm.module.linear_fc1.weight.dtype == torch.bfloat16

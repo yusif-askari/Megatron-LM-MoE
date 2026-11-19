@@ -18,6 +18,7 @@ extension (asymmetric tails), learnable gates, and baselines.
 Self-test (g(0)=0 and autograd == analytic g' for every builder gate):
     uv run python new_gates.py
 """
+import itertools
 import math
 
 import torch
@@ -269,28 +270,228 @@ def exp_arglu(x):
     return torch.where(x <= 0.0, 1.0 - torch.sqrt(1.0 - xm), xp - 0.5 + 0.5 / (1.0 + xp))
 
 
+# ---- learnable gate: pglu ------------------------------------------------------
+# Per expert (one pair per dense / shared MLP): p = softplus(rho) > 0 and a shift b,
+#     g'(x) = (1 + |x - b|)^(-p),   g(x) = F_p(x - b) - F_p(-b),   g(0) = 0,
+#     F_p(u) = sign(u) ((1 + |u|)^q - 1) / q = sign(u) l exprel(q l),  l = ln(1 + |u|),  q = 1 - p.
+# The GLU output is h = g(y_gate) * y_value * prob (prob: the router probability, 1 for dense MLPs).
+#
+# Numerics. Ported from the MXFP4 fork (megatron-main), where this is also the reference of the fused
+# MXFP4 kernels (ALTO fused_swiglu.py with GATE=1).
+#  - Forward: fp32 from the bf16 fc1 output y = [y_gate | y_value] to h, rounded to bf16 once:
+#        h = bf16( g(y_gate) * y_value * prob )
+#    (the earlier version here rounded the gate, gate * value and the prob product to bf16 one by one).
+#  - No cancellation in g(x) = F_p(x - b) - F_p(-b). When x - b and -b have the same sign s (x between 0
+#    and b, or beyond 0 away from b), with B = 1 + |b| and 1 + |x - b| = B (1 + w), w = s x / B:
+#        g(x) = s B^q L exprel(q L),  L = ln(1 + w)
+#    (the difference of the two F_p terms, ~F_p(-b) each, cost ~eps |F_p(-b)| / |g(x)| relative near x = 0).
+#    Otherwise the two terms have opposite signs and are added as they are. The derivatives use the
+#    same split: g'(x) = B^-p (1 + w)^-p, dg/db = B^-p - g'(x) = -B^-p expm1(-p L), and dg/dp below.
+#  - The slope at x = b is 1 (autograd of sign(u) * ln(1 + |u|) gives 0 there: the earlier version dropped
+#    the x-gradient and part of the b-gradient wherever the bf16 gate input equalled the bf16 b).
+#  - Backward: analytic, fp32 from dh. d(y_gate) and d(y_value) are rounded to bf16 once each; d(prob),
+#    dp and db are fp32 per-row sums; per expert, differences of fp64 prefix sums (deterministic).
+#  - exprel(z) and d exprel(z)/dz = phi(z) = (e^z (z - 1) + 1) / z^2 use their series for |z| < 0.5 and the
+#    closed forms (from exp) beyond. No expm1: torch.compile lowers it to exp(z) - 1, ~1e-3 relative error at
+#    |z| = 1e-4 (p ~ 1). phi's closed form loses ~4 eps / |z| (the earlier version's autograd through
+#    expm1(z)/z did that down to |z| = 1e-3).
+#  - rho and b stay fp32 parameters (keep_fp32: Float16Module does not cast them to bf16), so the forward
+#    uses the optimizer's value, not a bf16 rounding of it (bf16 spacing at b = 1 is 2^-7).
+_PHI_SERIES = (0.5, 1.0 / 3.0, 1.0 / 8.0, 1.0 / 30.0, 1.0 / 144.0, 1.0 / 840.0, 1.0 / 5760.0, 1.0 / 45360.0)
+# per-expert coefficient columns (pglu_coefficients; the kernels read the same [E, 9] fp32 table)
+PGLU_NCOEF = 9           # p, b, C = F_p(-b), s = sign(-b), B = 1 + |b|, B^q, K = B^-p, ln B, dC/dp
+
+
+def _exprel_series(z):
+    c = _EXPREL_SERIES
+    return c[0] + z * (c[1] + z * (c[2] + z * (c[3] + z * (c[4] + z * (c[5] + z * (c[6] + z * (c[7] + z * c[8])))))))
+
+
+def _exprel(z):
+    """(exprel(z), expm1(z)) with exprel(z) = (e^z - 1) / z: series for |z| < 0.5 (truncation < 1e-9 relative),
+    (exp(z) - 1) / z beyond. Built from exp only: torch.compile lowers expm1 to exp(z) - 1 (CPU inductor),
+    which loses ~eps/|z| relative near 0, the p ~ 1 regime pglu starts in."""
+    small = z.abs() < 0.5
+    zs = torch.where(small, torch.ones_like(z), z)
+    ex = torch.where(small, _exprel_series(z), (torch.exp(zs) - 1.0) / zs)
+    return ex, z * ex
+
+
+def _phi(z, em1):
+    """(e^z (z - 1) + 1) / z^2 = d exprel(z) / dz, with em1 = expm1(z)."""
+    small = z.abs() < 0.5
+    zs = torch.where(small, torch.ones_like(z), z)
+    c = _PHI_SERIES
+    series = c[0] + z * (c[1] + z * (c[2] + z * (c[3] + z * (c[4] + z * (c[5] + z * (c[6] + z * c[7]))))))
+    return torch.where(small, series, (zs * em1 + zs - em1) / (zs * zs))
+
+
+def pglu_coefficients(raw_p, b):
+    """Per-expert coefficient table [E, PGLU_NCOEF] fp32 (columns: see PGLU_NCOEF); one fused kernel."""
+    return _fused(_pglu_coefficients)(raw_p, b)
+
+
+def _pglu_coefficients(raw_p, b):
+    p = F.softplus(raw_p.float())
+    b = b.float()
+    q = 1.0 - p
+    lb = torch.log1p(b.abs())
+    zb = q * lb
+    exb, em1b = _exprel(zb)
+    s = torch.sign(-b)
+    c = s * lb * exb
+    dc_dp = -s * lb * lb * _phi(zb, em1b)
+    return torch.stack([p, b, c, s, 1.0 + b.abs(), em1b + 1.0, torch.exp(-p * lb), lb, dc_dp], dim=-1)
+
+
+def _pglu_eval(x, cr):
+    """fp32 gate input x and coefficient columns cr [.., 9] -> gate and the terms its derivatives reuse."""
+    p, b, c, s, bb, bq = (cr[..., i:i + 1] for i in range(6))
+    u = x - b
+    su = torch.sign(u)
+    same = (s != 0) & (su == s)
+    w = torch.where(same, s * x / bb, u.abs())
+    l = torch.log1p(w)
+    z = (1.0 - p) * l
+    ex, em1 = _exprel(z)
+    gate = torch.where(same, s * bq * l * ex, su * l * ex - c)
+    return gate, same, su, w, l, z, em1, ex
+
+
+def _pglu_fwd(g, v, cr, prob):
+    gate = _pglu_eval(g.float(), cr)[0]
+    return (gate * v.float() * prob).to(g.dtype)
+
+
+def _pglu_bwd(dh, g, v, cr, prob):
+    vf, dhf = v.float(), dh.float()
+    gate, same, su, w, l, z, em1, ex = _pglu_eval(g.float(), cr)
+    p, s, bq, k, lb, dc_dp = (cr[..., i:i + 1] for i in (0, 3, 5, 6, 7, 8))
+    d_out = dhf * prob
+    d_v = (d_out * gate).to(g.dtype)
+    dgate = d_out * vf                                  # dL/dg(x)
+    gp1 = (em1 + 1.0) / (1.0 + w)                       # (1 + w)^-p
+    gp = torch.where(same, k * gp1, gp1)                # g'(x) = (1 + |x - b|)^-p
+    d_g = (dgate * gp).to(g.dtype)
+    phi = _phi(z, em1)
+    dg_dp = torch.where(same, -s * bq * l * (lb * ex + l * phi), -su * l * l * phi - dc_dp)
+    # dg/db = K - g'(x); same side: -K expm1(-p L), with (1 + w)^-p = gp1 = e^zp (series near zp = 0)
+    zp = -p * l
+    dg_db = torch.where(same, torch.where(zp.abs() < 0.5, -k * zp * _exprel_series(zp), k * (1.0 - gp1)), k - gp1)
+    dprob = (gate * vf * dhf).sum(-1, keepdim=True)
+    sums = torch.stack([(dgate * dg_dp).sum(-1), (dgate * dg_db).sum(-1)], -1)
+    return d_g, d_v, dprob, sums
+
+
+_COMPILED = {}
+
+
+def _fused(fn):
+    """fn through Megatron's jit fuser as configured when first called (torch.compile in training)."""
+    if fn not in _COMPILED:
+        try:
+            from megatron.core import jit as _jit
+            f = _jit.jit_fuser
+        except Exception:                            # standalone (file loaded by path)
+            f = jit_fuser
+        _COMPILED[fn] = f(fn, dynamic=True) if f is torch.compile else (fn if f is torch.jit.script else f(fn))
+    return _COMPILED[fn]
+
+
+def pglu_bwd_rows(dh, y, prob, cr):
+    """Backward of h = bf16(g(y_gate) * y_value * prob) for rows with coefficient rows cr ([N, 9] or [1, 9]):
+    dy [N, 2F] (bf16 halves), dprob [N, 1] fp32, sums [N, 2] fp32 = per-row sums of dL/dp, dL/db."""
+    g, v = torch.chunk(y, 2, dim=-1)
+    d_g, d_v, dprob, sums = _fused(_pglu_bwd)(dh, g, v, cr, prob)
+    return torch.cat([d_g, d_v], dim=-1), dprob, sums
+
+
+def segment_sum(s, counts):
+    """Sums of the rows of s [N, k] over consecutive segments of the given lengths -> [E, k] fp64,
+    as differences of fp64 prefix sums (deterministic, no atomics)."""
+    if len(counts) == 1:
+        return s.double().sum(0, keepdim=True)
+    # prefix sums along the contiguous dim ([k, N]; ROCm's cumsum over dim 0 of [N, k] is ~70x slower)
+    cs = F.pad(s.t().double().contiguous().cumsum(1), (1, 0))
+    bounds = torch.tensor([0, *itertools.accumulate(counts)], device=s.device)
+    return (cs[:, bounds[1:]] - cs[:, bounds[:-1]]).t()
+
+
+def pglu_param_grads(raw_p, sums):
+    """dL/drho, dL/db [E] fp32 from the per-expert sums [E, 2] (dL/dp, dL/db); dp/drho = sigmoid(rho)."""
+    dp, db = sums.unbind(-1)
+    return (dp * torch.sigmoid(raw_p.double())).float(), db.float()
+
+
+def _rows(coef, counts, n):
+    """Per-expert table [E, 9] -> per-row [N, 9] (or [1, 9] for one expert)."""
+    if len(counts) == 1:
+        return coef
+    return torch.repeat_interleave(coef, torch.as_tensor(counts, device=coef.device), dim=0, output_size=n)
+
+
+class _WeightedPGLU(torch.autograd.Function):
+    """h = bf16(g(y_gate) * y_value * prob) over expert-sorted rows (segments of `counts` rows)."""
+
+    @staticmethod
+    def forward(ctx, y, prob, raw_p, b, counts):
+        g, v = torch.chunk(y, 2, dim=-1)
+        pr = prob.float() if prob is not None else _one(y.device)
+        cr = _rows(pglu_coefficients(raw_p, b), counts, y.shape[0])
+        h = _fused(_pglu_fwd)(g, v, cr, pr)
+        ctx.save_for_backward(y, prob, raw_p, b)
+        ctx.counts = counts
+        return h
+
+    @staticmethod
+    def backward(ctx, dh):
+        y, prob, raw_p, b = ctx.saved_tensors
+        pr = prob.float() if prob is not None else _one(y.device)
+        cr = _rows(pglu_coefficients(raw_p, b), ctx.counts, y.shape[0])
+        dy, dprob, sums = pglu_bwd_rows(dh, y, pr, cr)
+        d_raw, d_b = pglu_param_grads(raw_p, segment_sum(sums, ctx.counts))
+        dprob = dprob.to(prob.dtype).reshape(prob.shape) if prob is not None and ctx.needs_input_grad[1] else None
+        return dy, dprob, d_raw.to(raw_p.dtype), d_b.to(b.dtype), None
+
+
+class _PGLUGate(torch.autograd.Function):
+    """The gate alone, g(x) in x.dtype (analysis: --log-glu-stats, tests), for rows of local expert idx [N]
+    (None: one expert): fp32 inside, the analytic slope (1 at x = b), dL/drho and dL/db summed per expert."""
+
+    @staticmethod
+    def forward(ctx, x, raw_p, b, idx):
+        coef = pglu_coefficients(raw_p, b)
+        cr = coef if idx is None else coef.index_select(0, idx)
+        ctx.save_for_backward(x, raw_p, b, idx)
+        xs = x.unsqueeze(-1) if x.dim() == 1 else x            # 1-D x: one row per element
+        return _pglu_eval(xs.float(), cr)[0].to(x.dtype).reshape(x.shape)
+
+    @staticmethod
+    def backward(ctx, dy):
+        x, raw_p, b, idx = ctx.saved_tensors
+        coef = pglu_coefficients(raw_p, b)
+        cr = coef if idx is None else coef.index_select(0, idx)
+        xs = x.unsqueeze(-1) if x.dim() == 1 else x
+        dys = dy.reshape(xs.shape)
+        d_x, _, _, sums = _fused(_pglu_bwd)(dys, xs, torch.ones_like(xs), cr, _one(x.device))
+        d_x = d_x.reshape(x.shape)
+        d_raw = d_b = None
+        if ctx.needs_input_grad[1] or ctx.needs_input_grad[2]:
+            s = sums.reshape(-1, 2).double()
+            if idx is None:
+                tot = s.sum(0, keepdim=True)
+            else:
+                tot = torch.zeros(raw_p.numel(), 2, dtype=torch.float64, device=s.device).index_add_(0, idx, s)
+            d_raw, d_b = pglu_param_grads(raw_p, tot)
+            d_raw, d_b = d_raw.to(raw_p.dtype), d_b.to(b.dtype)
+        return d_x, d_raw, d_b, None
+
+
 # ---- learnable gates ---------------------------------------------------------
 # One coefficient set per local expert (num_local_experts=1 for dense / shared MLPs, and for
 # standalone use). forward(x, tokens_per_expert) maps each expert's coefficients onto its rows
 # of the expert-concatenated [N, F] input; forward(x, expert_ids=ids) does the same from
 # explicit row ids (used by --log-glu-stats). Math runs in (at least) fp32, output in x.dtype.
-def _exprel(z):
-    """(e^z - 1)/z with its Taylor series near 0, so value and d/dz stay finite at z = 0."""
-    small = z.abs() < 1e-3
-    zs = torch.where(small, torch.ones_like(z), z)
-    return torch.where(small, 1.0 + z * (0.5 + z * (1.0 / 6.0 + z / 24.0)), torch.expm1(zs) / zs)
-
-def _bump_integral(u, p):
-    """F_p(u) = sign(u) ((1+|u|)^(1-p) - 1)/(1-p)  (sign(u) ln(1+|u|) at p = 1), written as
-    sign(u) l exprel((1-p) l) with l = ln(1+|u|): smooth in p, so dF/dp is exact at p = 1."""
-    l = torch.log1p(u.abs())
-    return torch.sign(u) * l * _exprel((1.0 - p) * l)
-
-@jit_fuser
-def _pglu(x, p, b):
-    xf = x.to(p.dtype)
-    return (_bump_integral(xf - b, p) - _bump_integral(-b, p)).to(x.dtype)
-
 @jit_fuser
 def _xrlglu(x, a):
     xf = x.to(a.dtype)
@@ -307,8 +508,10 @@ class _PerExpertGate(MegatronModule):
         self._expert_parallel = (num_local_experts > 1 and config is not None
                                  and getattr(config, "expert_model_parallel_size", 1) > 1)
 
-    def _param(self, value):
-        t = nn.Parameter(torch.full((self.num_local_experts,), float(value)))
+    def _param(self, value, keep_fp32=False):
+        t = nn.Parameter(torch.full((self.num_local_experts,), float(value), dtype=torch.float32))
+        if keep_fp32:
+            t.keep_fp32 = True                         # Float16Module leaves it fp32
         if self._expert_parallel:
             t.allreduce = False
         return t
@@ -330,16 +533,42 @@ class _PerExpertGate(MegatronModule):
 class ExpPGLU(_PerExpertGate):
     """Learnable tail exponent p = softplus(rho) > 0 and shift b (per expert):
     g'(x) = 1/(1+|x-b|)^p, g(x) = F_p(x-b) - F_p(-b), g(0) = 0. The default init (p=1, b=1)
-    is exactly exp_l0m1r0_p1_b1."""
+    is exactly exp_l0m1r0_p1_b1. The MLPs call weighted_glu (fc1 output -> fc2 input); rho and b
+    are fp32 parameters (keep_fp32). See the pglu section above for the numerics."""
+
     def __init__(self, config=None, p_init=1.0, b_init=1.0, num_local_experts=1):
         super().__init__(config, num_local_experts)
-        self.raw_p = self._param(torch.log(torch.expm1(torch.tensor(float(p_init)))).item())
-        self.b = self._param(b_init)
+        self.raw_p = self._param(torch.log(torch.expm1(torch.tensor(float(p_init)))).item(), keep_fp32=True)
+        self.b = self._param(b_init, keep_fp32=True)
+
     def coefficients(self):
         return {"p": F.softplus(self.raw_p.float()), "b": self.b.float()}
+
+    def _counts(self, n, tokens_per_expert):
+        if self.num_local_experts == 1:
+            return [n]
+        if tokens_per_expert is None:
+            raise ValueError(f"{type(self).__name__} with {self.num_local_experts} local experts "
+                             "needs tokens_per_expert")
+        return [int(t) for t in tokens_per_expert]
+
+    def weighted_glu(self, y, probs=None, tokens_per_expert=None):
+        """h = bf16(gate(y_gate) * y_value * probs) for the fc1 output y [N, 2F] (expert-sorted rows),
+        probs [N, 1] or None."""
+        return _WeightedPGLU.apply(y, probs, self.raw_p, self.b, self._counts(y.shape[0], tokens_per_expert))
+
     def forward(self, x, tokens_per_expert=None, expert_ids=None):
-        p = F.softplus(self._rows(self.raw_p, x, tokens_per_expert, expert_ids))
-        return _pglu(x, p, self._rows(self.b, x, tokens_per_expert, expert_ids))
+        """The gate alone, g(x) in x.dtype (analysis; training uses weighted_glu)."""
+        if expert_ids is not None:
+            idx = expert_ids.long()
+        elif self.num_local_experts == 1:
+            idx = None
+        else:
+            counts = torch.as_tensor(self._counts(x.shape[0], tokens_per_expert), device=x.device)
+            idx = torch.repeat_interleave(torch.arange(self.num_local_experts, device=x.device), counts,
+                                          output_size=x.shape[0])
+        return _PGLUGate.apply(x, self.raw_p, self.b, idx)
+
 
 class ExpXRLGLU(_PerExpertGate):
     """Learnable negative-dip depth alpha (expanded-range trick on RLGLU), per expert: g'

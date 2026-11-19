@@ -435,19 +435,27 @@ class Float16Module(MegatronModule):
         self.pg_collection = getattr(module, 'pg_collection', None)
 
         if self.fp16:
-            self.add_module('module', module.half())
+            dtype = torch.half
 
             def float16_convertor(val):
                 return val.half()
 
         elif self.bf16:
-            self.add_module('module', module.bfloat16())
+            dtype = torch.bfloat16
 
             def float16_convertor(val):
                 return val.bfloat16()
 
         else:
             raise Exception('Either config.fp16 or config.bf16 should be True.')
+
+        def convert_module(val):
+            # keep_fp32: small parameters whose forward should use the fp32 value (exp_gates pglu)
+            if getattr(val, 'keep_fp32', False) or not val.is_floating_point():
+                return val
+            return val.to(dtype=dtype)
+
+        self.add_module('module', module._apply(convert_module))
 
         self.float16_convertor = float16_convertor
 
