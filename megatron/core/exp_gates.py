@@ -18,6 +18,8 @@ extension (asymmetric tails), learnable gates, and baselines.
 Self-test (g(0)=0 and autograd == analytic g' for every builder gate):
     uv run python new_gates.py
 """
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -47,6 +49,159 @@ def _antideriv(u, L, M, R, p):
 def _builder_gate(x, L, M, R, p, b):
     """gate(x) = int_0^x g'(t-b) dt, pinned gate(0)=0."""
     return _antideriv(x - b, L, M, R, p) - _antideriv(-b * torch.ones_like(x), L, M, R, p)
+
+
+# ---- bump gates (L = R = 0): fp32 GLU rounded once, analytic backward -----------------------
+# For L = R = 0 the builder gate is
+#     g(x) = M (F_p(x - b) - F_p(-b)),   g'(x) = M (1 + |x - b|)^-p,
+#     F_p(u) = sign(u) ((1 + |u|)^q - 1) / q = sign(u) l exprel(q l),   l = ln(1 + |u|),  q = 1 - p
+# (exp_pglu with p and b fixed). _builder_gate in the generic GLU path has three defects on these
+# gates, all fixed here:
+#  - slope at x = b: autograd through abs / where gives L = 0 at u = 0; the true slope is M. bf16
+#    gate inputs equal to b = 1 are common (874 of 1.44M elements in the audit), and those rows
+#    lost their input gradient (d(y_gate) relative error 3.8e-2 .. 8.2e-2 on b = 1 bumps);
+#  - three bf16 roundings (gate, gate * x_linear, * prob): here h = bf16(g(x_glu) x_linear prob)
+#    is evaluated in fp32 and rounded once; d(x_glu), d(x_linear) are rounded once each and
+#    d(prob) is an fp32 row sum;
+#  - cancellation of F_p(x - b) - F_p(-b) near x = 0 (b != 0): where x - b and -b have the same
+#    sign s, with B = 1 + |b| and 1 + |x - b| = B (1 + w), w = s x / B,
+#        g(x) = M s B^q L exprel(q L),   L = ln(1 + w),   g'(x) = M B^-p (1 + w)^-p;
+#    otherwise the two terms have opposite signs and are added as they are.
+# exprel is built from exp (series for |z| < 0.5): torch.compile lowers expm1 to exp(z) - 1 on CPU.
+# Same expressions as exp_pglu's reference in the MXFP4 fork (megatron-main, pglu section).
+_EXPREL_SERIES = (1.0, 1.0 / 2.0, 1.0 / 6.0, 1.0 / 24.0, 1.0 / 120.0, 1.0 / 720.0, 1.0 / 5040.0,
+                  1.0 / 40320.0, 1.0 / 362880.0)
+
+
+def _exprel_exp(z):
+    """(e^z - 1) / z: series for |z| < 0.5 (truncation < 1e-9 relative), (exp(z) - 1) / z beyond."""
+    c = _EXPREL_SERIES
+    series = c[0] + z * (c[1] + z * (c[2] + z * (c[3] + z * (c[4] + z * (c[5] + z * (c[6] + z * (
+        c[7] + z * c[8])))))))
+    small = z.abs() < 0.5
+    zs = torch.where(small, torch.ones_like(z), z)
+    return torch.where(small, series, (torch.exp(zs) - 1.0) / zs)
+
+
+def _bump_eval(x, M, p, b, s, B, Bq, K, c):
+    """x (fp32 or wider) -> (g(x), g'(x)). Constants (BumpGate.k): s = sign(-b), B = 1 + |b|,
+    Bq = B^q, K = B^-p, c = F_p(-b)."""
+    q = 1.0 - p
+    u = x - b
+    su = torch.sign(u)
+    if s == 0.0:                                     # b = 0: g = M F_p(x), nothing subtracted
+        l = torch.log1p(u.abs())
+        return M * su * l * _exprel_exp(q * l), M * torch.exp(-p * l)
+    same = su == s
+    w = torch.where(same, (s / B) * x, u.abs())
+    l = torch.log1p(w)
+    ex = _exprel_exp(q * l)
+    gate = torch.where(same, (s * Bq) * l * ex, su * l * ex - c)
+    gp1 = torch.exp(-p * l)                          # (1 + w)^-p; = 1 at x = b
+    return M * gate, M * torch.where(same, K * gp1, gp1)
+
+
+def _wide(t):
+    return t.to(torch.promote_types(t.dtype, torch.float32))
+
+
+@jit_fuser
+def _bump_val(x, M, p, b, s, B, Bq, K, c):
+    return _bump_eval(_wide(x), M, p, b, s, B, Bq, K, c)[0].to(x.dtype)
+
+
+@jit_fuser
+def _bump_val_bwd(dy, x, M, p, b, s, B, Bq, K, c):
+    return (_wide(dy) * _bump_eval(_wide(x), M, p, b, s, B, Bq, K, c)[1]).to(x.dtype)
+
+
+@jit_fuser
+def _bump_glu_fwd(g, v, prob, M, p, b, s, B, Bq, K, c):
+    gate = _bump_eval(g.float(), M, p, b, s, B, Bq, K, c)[0]
+    return (gate * v.float() * prob).to(g.dtype)
+
+
+@jit_fuser
+def _bump_glu_bwd(dh, g, v, prob, M, p, b, s, B, Bq, K, c):
+    gate, gp = _bump_eval(g.float(), M, p, b, s, B, Bq, K, c)
+    vf, dhf = v.float(), dh.float()
+    d_out = dhf * prob
+    d_g = (d_out * vf * gp).to(g.dtype)
+    d_v = (d_out * gate).to(v.dtype)
+    dprob = (gate * vf * dhf).sum(-1, keepdim=True)
+    return d_g, d_v, dprob
+
+
+class _BumpGateFn(torch.autograd.Function):
+    """The gate alone, g(x) in x.dtype, with the analytic slope (analysis, --log-glu-stats)."""
+
+    @staticmethod
+    def forward(ctx, x, k):
+        ctx.save_for_backward(x)
+        ctx.k = k
+        return _bump_val(x, *k)
+
+    @staticmethod
+    def backward(ctx, dy):
+        (x,) = ctx.saved_tensors
+        return _bump_val_bwd(dy, x, *ctx.k), None
+
+
+_ONE = {}
+
+
+def _one(device):
+    if device not in _ONE:
+        _ONE[device] = torch.ones(1, dtype=torch.float32, device=device)
+    return _ONE[device]
+
+
+class _BumpGLU(torch.autograd.Function):
+    """h = bf16(g(x_glu) * x_linear * prob), fp32 inside, prob [N, 1] or None (= 1)."""
+
+    @staticmethod
+    def forward(ctx, g, v, prob, k):
+        pr = prob.float() if prob is not None else _one(g.device)
+        ctx.save_for_backward(g, v, prob)
+        ctx.k = k
+        return _bump_glu_fwd(g, v, pr, *k)
+
+    @staticmethod
+    def backward(ctx, dh):
+        g, v, prob = ctx.saved_tensors
+        pr = prob.float() if prob is not None else _one(g.device)
+        d_g, d_v, dprob = _bump_glu_bwd(dh, g, v, pr, *ctx.k)
+        if prob is not None and ctx.needs_input_grad[2]:
+            dprob = dprob.to(prob.dtype).reshape(prob.shape)
+        else:
+            dprob = None
+        return d_g, d_v, dprob, None
+
+
+class BumpGate:
+    """Builder gate with L = R = 0 (exp_l0m{M}r0_p{p}_b{b}). Called on x: the gate alone, g(x) in
+    x.dtype. The GLU paths call weighted_glu(x_glu, x_linear, probs) instead (fc1 output -> fc2
+    input, one rounding)."""
+    per_expert_gate = False
+
+    def __init__(self, M, p, b, name):
+        M, p, b = float(M), float(p), float(b)
+        q = 1.0 - p
+        lb = math.log1p(abs(b))
+        Fb = lb if q == 0.0 else math.expm1(q * lb) / q          # F_p(|b|)
+        s = 0.0 if b == 0.0 else -math.copysign(1.0, b)           # sign(-b)
+        B = 1.0 + abs(b)
+        self.k = (M, p, b, s, B, B ** q, B ** -p, s * Fb)
+        self.__name__ = name
+
+    def __call__(self, x):
+        return _BumpGateFn.apply(x, self.k)
+
+    def weighted_glu(self, x_glu, x_linear, probs=None):
+        return _BumpGLU.apply(x_glu, x_linear, probs, self.k)
+
+    def __repr__(self):
+        return f"BumpGate({self.__name__})"
 
 
 # ---- enumerate the non-redundant (L, M, R, power, shift) combos ---------------
@@ -87,8 +242,11 @@ BUILDER_GATES = {}
 
 def _register(L, M, R, p, b):
     name = f"exp_l{_f(L)}m{_f(M)}r{_f(R)}_p{_f(p)}_b{int(b)}"
-    BUILDER_GATES[name] = ((lambda x, L=L, M=M, R=R, p=p, b=b: _builder_gate(x, L, M, R, p, b)),
-                           (L, M, R, p, b))
+    if L == 0.0 and R == 0.0:                                    # bump: fused, see BumpGate
+        fn = BumpGate(M, p, b, name)
+    else:
+        fn = lambda x, L=L, M=M, R=R, p=p, b=b: _builder_gate(x, L, M, R, p, b)
+    BUILDER_GATES[name] = (fn, (L, M, R, p, b))
 
 for (L, M, R) in _shapes():
     zeros = (L == 0.0) + (R == 0.0)

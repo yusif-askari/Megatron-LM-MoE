@@ -213,6 +213,8 @@ class SharedExpertMLP(MLP):
 
                     def glu(x):
                         x = torch.chunk(x, 2, dim=-1)
+                        if hasattr(self.config.activation_func, "weighted_glu"):  # bump gates
+                            return self.config.activation_func.weighted_glu(x[0], x[1])
                         return self.config.activation_func(x[0]) * x[1]
 
                     intermediate_parallel = glu(intermediate_parallel)
