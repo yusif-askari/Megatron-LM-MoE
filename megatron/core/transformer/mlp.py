@@ -506,6 +506,28 @@ class MLP(MegatronModule):
                 scores = per_token_scale.unsqueeze(-1) if per_token_scale is not None else None
                 intermediate_parallel = self.xssglu_glu(x_glu, x_linear, scores=scores)
                 scale_fused = per_token_scale is not None
+            elif (self.config.gated_linear_unit and self.config.exp_learnable_gate is None
+                  and hasattr(self.config.activation_func, "weighted_glu")):
+                # --exp-gate bump gates (exp_gates.BumpGate): h = bf16(g(x_glu) x_linear scale)
+                # in fp32, rounded once, analytic backward
+                x_glu, x_linear = torch.chunk(intermediate_parallel, 2, dim=-1)
+                if (val := self.config.activation_func_clamp_value) is not None:
+                    x_glu = x_glu.clamp(min=None, max=val)
+                    x_linear = x_linear.clamp(min=-val, max=val)
+                if self.config.glu_linear_offset != 0.0:
+                    x_linear = x_linear + self.config.glu_linear_offset
+                gate_fn = self.config.activation_func
+                scores = per_token_scale.unsqueeze(-1) if per_token_scale is not None else None
+                h = gate_fn.weighted_glu(x_glu, x_linear, scores)
+                if glu_stats.is_active():  # --log-glu-stats, logging steps only
+                    with torch.no_grad():
+                        gate = gate_fn(x_glu)
+                        out = gate * x_linear
+                    site = "shared" if type(self).__name__ == "SharedExpertMLP" else "dense"
+                    glu_stats.record_glu(site, x_linear, x_glu, gate, out, gate_fn, None,
+                                         fc1_out=intermediate_parallel, module=self)
+                intermediate_parallel = h
+                scale_fused = per_token_scale is not None
             elif self.config.gated_linear_unit:
 
                 def glu(x):
