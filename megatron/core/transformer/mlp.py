@@ -335,7 +335,9 @@ class MLP(MegatronModule):
                 original_dtype = intermediate_parallel.dtype
                 intermediate_parallel = intermediate_parallel * per_token_scale.unsqueeze(-1)
                 intermediate_parallel = intermediate_parallel.to(original_dtype)
-        elif self.config.bias_activation_fusion:
+        # --log-glu-stats: on logging steps take the unfused path below, which records the
+        # per-block gate statistics (glu_stats.record_glu); the fused kernels record nothing.
+        elif self.config.bias_activation_fusion and not glu_stats.is_active():
             if per_token_scale is not None:
                 if self.activation_func == F.silu and self.config.gated_linear_unit:
                     # dtype is handled inside the fused kernel
@@ -431,7 +433,14 @@ class MLP(MegatronModule):
                 else:
                     raise ValueError("Only support fusion of gelu, swiglu, ssglu, rlglu and sssglu")
         else:
+            in_dtype = intermediate_parallel.dtype
+            # With bias_activation_fusion on, this branch only runs on --log-glu-stats logging steps:
+            # add the bias, compute the GLU and the per_token_scale multiply in fp32 and round once, like the
+            # fused kernel.
+            glu_fp32 = self.config.bias_activation_fusion
             if bias_parallel is not None:
+                if glu_fp32:
+                    intermediate_parallel = intermediate_parallel.float()
                 intermediate_parallel = intermediate_parallel + bias_parallel
             # When PolyNorm fuses the per_token_scale multiply into its kernel we skip the
             # eager post-multiply below (the fc2-bias scaling further down still uses per_token_scale).
@@ -513,6 +522,8 @@ class MLP(MegatronModule):
                     if (val := self.config.activation_func_clamp_value) is not None:
                         x_glu = x_glu.clamp(min=None, max=val)
                         x_linear = x_linear.clamp(min=-val, max=val)
+                    if glu_fp32:
+                        x_glu, x_linear = x_glu.float(), x_linear.float()
                     gate_fn = (self.exp_gate if self.config.exp_learnable_gate is not None
                                else self.config.activation_func)
                     gate = gate_fn(x_glu)
@@ -538,6 +549,7 @@ class MLP(MegatronModule):
                 original_dtype = intermediate_parallel.dtype
                 intermediate_parallel = intermediate_parallel * per_token_scale.unsqueeze(-1)
                 intermediate_parallel = intermediate_parallel.to(original_dtype)
+            intermediate_parallel = intermediate_parallel.to(in_dtype)  # no-op unless glu_fp32
         nvtx_range_pop(suffix="activation")
 
         # [s, b, h]
