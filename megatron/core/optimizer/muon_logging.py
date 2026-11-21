@@ -25,6 +25,22 @@ from megatron.core.utils import (
 
 from .layer_wise_optimizer import LayerWiseDistributedOptimizer
 
+
+def _raise_dynamo_recompile_limit(floor: int = 256) -> None:
+    """The compiled matrix-stats helpers below use ``dynamic=False``: one graph per weight-matrix
+    shape. A rank that owns many differently shaped matrices (e.g. a 1-node run of a model sized for
+    16 nodes) exceeds dynamo's default limit of 8, and with ``fullgraph=True`` that is an error
+    (FailOnRecompileLimitHit) instead of an eager fallback. Each shape still compiles only once."""
+    import torch._dynamo as _dynamo
+
+    cfg = _dynamo.config
+    for name in ("recompile_limit", "cache_size_limit"):
+        if hasattr(cfg, name):
+            setattr(cfg, name, max(getattr(cfg, name), floor))
+
+
+_raise_dynamo_recompile_limit()
+
 _GAIN_AXES = ("row", "col", "flat")
 _MATRIX_SQUARE_SUM, _MATRIX_ELEMENT_COUNT, _MATRIX_LOG_SUM, _WEIGHT_SQUARE_SUM, _WEIGHT_ELEMENT_COUNT, _MATRIX_NEAR_ZERO_START = range(6)  # fmt: skip
 
