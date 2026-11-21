@@ -16,6 +16,20 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _post_decay():
+    """(end in samples, final factor) of the optional post-decay phase, from the environment:
+    LR_POST_DECAY_END_SAMPLES=<int> (unset: no post-decay phase, LR stays at min_lr) and
+    LR_POST_DECAY_FACTOR=<float in [0, 1]> (default 0.1: min_lr -> 0.1 * min_lr)."""
+    import os
+
+    end = os.environ.get("LR_POST_DECAY_END_SAMPLES")
+    if not end:
+        return None, 1.0
+    factor = float(os.environ.get("LR_POST_DECAY_FACTOR", "0.1"))
+    assert 0.0 <= factor <= 1.0, f"LR_POST_DECAY_FACTOR={factor} must be in [0, 1]"
+    return int(end), factor
+
+
 class ParamGroupOverride(TypedDict):
     """Override values for a parameter group. These values may be optimizer-state/scheduler related.
 
@@ -179,6 +193,12 @@ class OptimizerParamScheduler:
         # Set the learning rate
         self.step(0)
         log_single_rank(logger, logging.INFO, f"> learning rate decay style: {self.lr_decay_style}")
+        end, factor = _post_decay()
+        if end is not None:
+            log_single_rank(
+                logger, logging.WARNING,
+                f"> post-decay LR phase: after {self.lr_decay_steps} samples each group goes linearly "
+                f"from its min_lr to {factor} x min_lr at {end} samples (LR_POST_DECAY_*)")
 
     def get_wd(self, param_group: Optional[dict] = None) -> float:
         """Weight decay incr functions
@@ -235,8 +255,17 @@ class OptimizerParamScheduler:
         if self.lr_decay_style == 'constant':
             return max_lr
 
-        # For any steps larger than `self.lr_decay_steps`, use `min_lr`.
+        # For any steps larger than `self.lr_decay_steps`, use `min_lr` -- or, when a post-decay
+        # phase is configured (LR_POST_DECAY_END_SAMPLES, see _post_decay), continue linearly from
+        # min_lr down to LR_POST_DECAY_FACTOR * min_lr, reached at LR_POST_DECAY_END_SAMPLES and
+        # held after it. Used to extend a finished run: the original decay (and the scheduler state
+        # stored in its checkpoints) is unchanged; only the steps after it get a new schedule.
         if self.num_steps > self.lr_decay_steps:
+            end, factor = _post_decay()
+            if end is not None and end > self.lr_decay_steps:
+                r = min(1.0, float(self.num_steps - self.lr_decay_steps)
+                        / float(end - self.lr_decay_steps))
+                return min_lr * (1.0 - r * (1.0 - factor))
             return min_lr
 
         # If we are done with the warmup period, use the decay style.
