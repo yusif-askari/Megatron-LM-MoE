@@ -44,6 +44,8 @@ Scale rules (``--mxfp4-scale-rule``):
 import itertools
 import math
 import os
+import re
+import sys
 
 import torch
 
@@ -244,6 +246,7 @@ def new_step():
     global _CACHE_ON
     _WCACHE.clear()
     _H.clear()
+    _ACC.clear()
     _CACHE_ON = True
 
 
@@ -310,25 +313,110 @@ def _accumulate_wgrad(w, dw):
     return dw.to(w.dtype)
 
 
+# ---- GEMM error statistics (--log-glu-stats logging steps only) ------------------------------
+# On a logging step every labelled GEMM (the MLP fc1 / fc2 of each layer, see apply_to_model) also
+# runs unquantized on the same operands, and glu_stats gets sum (approx-ref)^2, sum ref^2,
+# <approx, ref> and sum approx^2 -> relative error, cosine, projection <approx,ref>/|ref|^2
+# (gradient alignment; 1 = unbiased in magnitude) and SNR = |ref| / |approx - ref| for
+#   fprop (output), dgrad (input gradient), wgrad (one GEMM's weight gradient), and
+#   wgradstep: the weight gradient summed over all micro-batches of the step (the quantity the
+#   optimizer sees), for the first _STEP_EXPERTS local experts of each MoE layer. Its SNR is the
+#   gradient-to-quantization-noise ratio of "FP4 All the Way" (training degrades below ~sqrt 3).
+#   It is rank-local: equal to the step gradient when the expert data-parallel size is 1 (as in
+#   the 1-node checkpoint recompute); with expert DP > 1 it covers 1/DP of the tokens.
+# Costs one extra bf16 GEMM per GEMM on logging steps, and 2 fp32 copies of the accumulated
+# experts' weight gradients during the step.
+_LABELS = {}             # id(module) -> (site, layer, "fc1" | "fc2")
+_STEP_EXPERTS = 4
+_ACC = {}                # (site, layer, lin, e) -> [sum ref dW, sum approx dW] (fp32)
+_STAT_ROWS = 1 << 15     # row chunk for the error sums (bounds the fp32 temporaries)
+
+
+def _label_of(name):
+    """Decoder-relative module name -> (site, layer 1-based, fc1/fc2) for MLP linears, else None."""
+    m = re.search(r"layers\.(\d+)\.mlp\.(experts\.|shared_experts\.)?linear_(fc[12])$", name)
+    if m is None:
+        return None
+    site = {"experts.": "routed", "shared_experts.": "shared", None: "dense"}[m.group(2)]
+    return site, int(m.group(1)) + 1, m.group(3)
+
+
+def _stats():
+    """glu_stats if this is a logging step, else None (cheap; never imports it)."""
+    gs = sys.modules.get("megatron.core.transformer.glu_stats")
+    return gs if gs is not None and gs.is_active() else None
+
+
+def _err_sums(add, label, stage, ref, approx):
+    site, layer, lin = label
+    key = f"{site}/gemm/mx_{lin}_{stage}"
+    r2 = a2 = d = e2 = torch.zeros((), dtype=torch.float64, device=ref.device)
+    for r, a in zip(ref.reshape(-1, ref.shape[-1]).split(_STAT_ROWS),
+                    approx.reshape(-1, approx.shape[-1]).split(_STAT_ROWS)):
+        r, a = r.float(), a.float()
+        r2 = r2 + r.pow(2).sum(dtype=torch.float64)
+        a2 = a2 + a.pow(2).sum(dtype=torch.float64)
+        d = d + (a * r).sum(dtype=torch.float64)
+        e2 = e2 + (a - r).pow(2).sum(dtype=torch.float64)
+    add(key + "/errsq", layer, e2)
+    add(key + "/refsq", layer, r2)
+    add(key + "/dot", layer, d)
+    add(key + "/apxsq", layer, a2)
+
+
+def _record(label, stage, ref_fn, approx):
+    gs = _stats() if label is not None else None
+    if gs is None:
+        return
+    with torch.no_grad():
+        _err_sums(gs._add, label, stage, ref_fn(), approx)
+
+
+def _accumulate_step(label, ref, approx):
+    """Sum this GEMM's weight gradient (exact and as trained) into the step accumulators."""
+    if label is None or label[0] != "routed" or _stats() is None:
+        return
+    with torch.no_grad():
+        for e in range(min(_STEP_EXPERTS, ref.shape[0])):
+            acc = _ACC.get((*label, e))
+            if acc is None:
+                _ACC[(*label, e)] = [ref[e].float(), approx[e].float()]
+            else:
+                acc[0].add_(ref[e].float())
+                acc[1].add_(approx[e].float())
+
+
+def flush_step_stats(add):
+    """Called by glu_stats.reduce_and_log on every rank: error sums of the accumulated step
+    weight gradients (stage "wgradstep"), then the accumulators are freed."""
+    for (site, layer, lin, _e), (ref, approx) in sorted(_ACC.items(), key=lambda kv: kv[0]):
+        _err_sums(add, (site, layer, lin), "wgradstep", ref, approx)
+    _ACC.clear()
+
+
 class _MXFP4GroupedLinear(torch.autograd.Function):
     """y[e] = Q(x[e]) · Q(W_e)ᵀ for the token segments of each local expert (no bias)."""
 
     @staticmethod
-    def forward(ctx, x, m_splits, rule, recipe, *weights):
+    def forward(ctx, x, m_splits, rule, recipe, label, *weights):
         n_tok = sum(m_splits)
         assert x.shape[0] == n_tok, (x.shape, n_tok)
-        ctx.m_splits, ctx.rule, ctx.recipe = list(m_splits), rule, recipe
+        ctx.m_splits, ctx.rule, ctx.recipe, ctx.label = list(m_splits), rule, recipe, label
         ctx.save_for_backward(x, *weights)
         rule = _pass_rule(rule, "fwd")
         xq = qdq(x, rule, dim=-1)                                           # [T, K] along K
         wq = _weight_fwd(id(weights[0]), lambda: torch.stack(weights), rule, recipe)  # [E, N, K]
         offs = _offsets(ctx.m_splits, x.device)
-        return torch._grouped_mm(xq, wq.transpose(1, 2), offs=offs)          # [T, N]
+        y = torch._grouped_mm(xq, wq.transpose(1, 2), offs=offs)             # [T, N]
+        _record(label, "fprop",
+                lambda: torch._grouped_mm(x, torch.stack(weights).transpose(1, 2), offs=offs), y)
+        return y
 
     @staticmethod
     def backward(ctx, dy):
         x, *weights = ctx.saved_tensors
         rule, recipe, m_splits = _pass_rule(ctx.rule, "bwd"), ctx.recipe, ctx.m_splits
+        label = ctx.label
         dy = dy.contiguous()
         offs = _offsets(m_splits, x.device)
         dx = None
@@ -336,6 +424,8 @@ class _MXFP4GroupedLinear(torch.autograd.Function):
             dyq = qdq(dy, rule, dim=-1, sr=recipe == "alto")                # along N
             wq = _weight_dgrad(id(weights[0]), lambda: torch.stack(weights), rule, recipe, 1)
             dx = torch._grouped_mm(dyq, wq, offs=offs)                       # [T, K]
+            _record(label, "dgrad",
+                    lambda: torch._grouped_mm(dy, torch.stack(weights), offs=offs), dx)
         # wgrad: contraction over each expert's tokens -> pad every segment to a multiple of 32
         padded = [int(math.ceil(m / BLOCK) * BLOCK) for m in m_splits]
         if sum(padded) != sum(m_splits):
@@ -355,8 +445,14 @@ class _MXFP4GroupedLinear(torch.autograd.Function):
         # bf16 output: _grouped_mm cannot emit fp32 from bf16 inputs on sm90. The extra bf16
         # rounding of dW (~2^-9 relative) is negligible next to the MXFP4 operand error (~15%).
         dw = torch._grouped_mm(dyq_t.t(), xq_t, offs=poffs)                  # [E, N, K]
+        if label is not None and _stats() is not None:
+            # exact: (H·dy)ᵀ(H·x) = dyᵀx, so the reference uses the unrotated, unquantized operands
+            ref = torch._grouped_mm(dyp.t(), xp, offs=poffs)
+            _record(label, "wgrad", lambda: ref, dw)
+            _accumulate_step(label, ref, dw)
+            del ref
         grads = [_accumulate_wgrad(w, dw[e]) for e, w in enumerate(weights)]
-        return (dx, None, None, None, *grads)
+        return (dx, None, None, None, None, *grads)
 
 
 _DUMMY = {}
@@ -371,48 +467,54 @@ def _dummy_grad(w):
     return _DUMMY[key]
 
 
-def grouped_linear(x: torch.Tensor, m_splits, weights, rule: str, recipe: str = "plain"):
-    """Emulated-MXFP4 grouped GEMM over the local experts' token segments."""
-    return _MXFP4GroupedLinear.apply(x, list(m_splits), rule, recipe, *weights)
+def grouped_linear(x: torch.Tensor, m_splits, weights, rule: str, recipe: str = "plain",
+                   label=None):
+    """Emulated-MXFP4 grouped GEMM over the local experts' token segments. ``label`` =
+    (site, layer, fc1/fc2) enables the GEMM error statistics on logging steps."""
+    return _MXFP4GroupedLinear.apply(x, list(m_splits), rule, recipe, label, *weights)
 
 
 def te_grouped_linear_forward(module, x: torch.Tensor, m_splits, rule: str, recipe: str = "plain"):
     """Drop-in for ``TEGroupedLinear(x, m_splits)`` (no bias, TP = 1): returns (output, None)."""
     assert getattr(module, "use_bias", False) is False, "MXFP4 emulation supports bias-free experts"
     weights = [getattr(module, f"weight{i}") for i in range(module.num_gemms)]
-    return grouped_linear(x, m_splits, weights, rule, recipe), None
+    return grouped_linear(x, m_splits, weights, rule, recipe, _LABELS.get(id(module))), None
 
 
 class _MXFP4Linear(torch.autograd.Function):
     """y = Q(x) · Q(W)ᵀ for x [T, K], W [N, K] (no bias)."""
 
     @staticmethod
-    def forward(ctx, x, w, rule, recipe):
-        ctx.rule, ctx.recipe = rule, recipe
+    def forward(ctx, x, w, rule, recipe, label):
+        ctx.rule, ctx.recipe, ctx.label = rule, recipe, label
         ctx.save_for_backward(x, w)
         rule = _pass_rule(rule, "fwd")
         wq = _weight_fwd(id(w), lambda: w, rule, recipe)
-        return qdq(x, rule, dim=-1) @ wq.t()
+        y = qdq(x, rule, dim=-1) @ wq.t()
+        _record(label, "fprop", lambda: x @ w.t(), y)
+        return y
 
     @staticmethod
     def backward(ctx, dy):
         x, w = ctx.saved_tensors
-        rule, recipe = _pass_rule(ctx.rule, "bwd"), ctx.recipe
+        rule, recipe, label = _pass_rule(ctx.rule, "bwd"), ctx.recipe, ctx.label
         dy = dy.contiguous()
         dx = None
         if ctx.needs_input_grad[0]:
             wq = _weight_dgrad(id(w), lambda: w, rule, recipe, 0)
             dx = qdq(dy, rule, dim=-1, sr=recipe == "alto") @ wq
+            _record(label, "dgrad", lambda: dy @ w, dx)
         rows = int(math.ceil(x.shape[0] / BLOCK) * BLOCK)
         xq_t, dyq_t = _wgrad_operands(_pad_rows(x, rows), _pad_rows(dy, rows), rule, recipe)
         dw = dyq_t.t() @ xq_t                                                 # along tokens
-        return dx, _accumulate_wgrad(w, dw), None, None
+        _record(label, "wgrad", lambda: dy.t() @ x, dw)
+        return dx, _accumulate_wgrad(w, dw), None, None, None
 
 
-def linear(x: torch.Tensor, w: torch.Tensor, rule: str, recipe: str = "plain") -> torch.Tensor:
+def linear(x: torch.Tensor, w: torch.Tensor, rule: str, recipe: str = "plain", label=None) -> torch.Tensor:
     """Emulated-MXFP4 x · Wᵀ over the last dim of x (any leading shape)."""
     lead = x.shape[:-1]
-    y = _MXFP4Linear.apply(x.reshape(-1, x.shape[-1]), w, rule, recipe)
+    y = _MXFP4Linear.apply(x.reshape(-1, x.shape[-1]), w, rule, recipe, label)
     return y.reshape(*lead, w.shape[0])
 
 
@@ -434,7 +536,7 @@ def _fused_norm(module, x):
 def _te_linear_forward(module, x, rule, recipe, fused_norm):
     if fused_norm:
         x = _fused_norm(module, x)
-    return linear(x, module.weight, rule, recipe), None
+    return linear(x, module.weight, rule, recipe, _LABELS.get(id(module))), None
 
 
 def apply_to_model(model, rule: str, recipe: str = "plain", skip=()) -> list:
@@ -453,6 +555,9 @@ def apply_to_model(model, rule: str, recipe: str = "plain", skip=()) -> list:
     if decoder is None:
         raise ValueError("--mxfp4-emulate all_linear expects a model with a .decoder block")
     for name, mod in decoder.named_modules():
+        label = _label_of(name)
+        if label is not None:       # MLP fc1 / fc2 (incl. the grouped experts): GEMM error stats
+            _LABELS[id(mod)] = label
         fused = isinstance(mod, TELayerNormColumnParallelLinear)
         if not (fused or isinstance(mod, TELinear)):
             continue

@@ -13,6 +13,20 @@ For a GLU  h = z1 * f(z2)  (z2 = gate input, f = the gate, h = input of fc2):
 
   moments    RMS, absmax, crest factor (absmax/RMS), kurtosis E[x^4]/E[x^2]^2
              of z1, z2, f(z2), h and of the gradients dz1, dz2.
+  blk32      per-block kurtosis mean(x^4)/mean(x^2)^2 (about 0) of every 1x32 block along the
+             last dim (the MXFP4 block), for every tensor above and the residual / logits:
+             mean, p50/p90/p99 (from a 248-bin histogram over [1, 32]), max, fraction of
+             blocks above 8 and 16, and the mean block absmax/rms. Tags gate-blk32/...
+             (residual/blk32_..., logits/blk32_...). Bounded by 32; a Gaussian block gives ~2.8.
+  mxfp4alto  MXFP4 exactly as the training emulation applies it (mxfp4_emulation: alto e8m0
+             scale from the block amax in the tensor's dtype, 1x32 along the last dim): RN flush
+             fraction and relerr, and for stochastic rounding (what the alto recipe uses on
+             gradients) the mean probability that a non-zero element becomes 0 and the
+             expected relerr, both analytic (no sampling). For h and dz2.
+  fp4blk     dead zone relative to each 1x32 block's OWN largest slope |f'(z2)| (the dgrad block
+             of dz2) with the real alto scale: fraction of slopes RN would flush, mean SR
+             zero probability; plus the mean block-max slope and the fraction of blocks whose max
+             slope is > 1 (the fixed-floor deadzone_fp4 assumes it is 1).
   fake-quant low precision is simulated on the bf16 training tensors, blocked
              along the last (hidden-unit) dim as in the forward / dgrad GEMM
              operands: FP8 e4m3 1x128 blocks (DeepSeek-V3), MXFP4 1x32 with an
@@ -84,6 +98,14 @@ _MIN_ROWS = 32
 _MAX_WEIGHT_EXPERTS = 8                # local experts per rank for weight / alignment stats
 _MEDIAN_SAMPLE = 1 << 20
 _FP8_SUBNORMAL = 2.0 ** -6
+_BLK = 32                    # block size of the per-block kurtosis (the MXFP4 block)
+_BLK_BINS = 248              # histogram of per-block kurtosis over [1, 32], bin width 0.125
+_BLK_THRESH = (8.0, 16.0)    # logged: fraction of blocks with kurtosis above these
+# per-block max|x| / median|x|: histogram of log2(ratio) over [0, 12.4), bin 0.05 (same bin count as
+# the kurtosis histogram); MXFP4 RN flushes |x| < max/16..max/28, so ratio > 16 / > 28 means the
+# block's median element is flushed (sometimes / always)
+_MM_LOG2_MAX = 12.4
+_MM_THRESH = (16.0, 28.0)
 
 GLU_SITES = ("routed", "shared", "dense")
 GLU_TENSORS = ("z1", "z2", "g", "h", "dz1", "dz2")
@@ -95,6 +117,90 @@ def _blocks(x, b):
     if pad:
         x = torch.nn.functional.pad(x, (0, pad))
     return x.reshape(*x.shape[:-1], -1, b)
+
+
+def blk32_stats(cf):
+    """Per-block (1x32 along the last dim, the MXFP4 block) kurtosis and crest of float32 cf.
+    kappa = mean(x^4) / mean(x^2)^2 about 0 (the FP4 scale is set from the block absmax, not
+    the spread about the mean); crest = absmax / rms. Both are computed on x / absmax so tiny
+    gradients do not underflow. All-zero blocks are skipped. 1 <= kappa <= 32, 1 <= crest <= sqrt(32).
+    Returns (n_blocks, sum kappa, sum crest, max kappa, histogram of kappa [_BLK_BINS])."""
+    xb = _blocks(cf, _BLK)
+    amax = xb.abs().amax(-1, keepdim=True)
+    live = amax.squeeze(-1) > 0
+    y = (xb / amax.clamp(min=1e-30))[live]
+    y2 = y * y
+    m2, m4 = y2.mean(-1), (y2 * y2).mean(-1)
+    kap = m4 / (m2 * m2)
+    crest = m2.rsqrt()
+    idx = ((kap - 1.0) * (_BLK_BINS / (_BLK - 1.0))).long().clamp(0, _BLK_BINS - 1)
+    hist = torch.bincount(idx, minlength=_BLK_BINS).double()
+    kmax = kap.max() if kap.numel() else torch.zeros((), device=cf.device)
+    return (live.sum(dtype=torch.float64), kap.sum(dtype=torch.float64),
+            crest.sum(dtype=torch.float64), kmax.float(), hist)
+
+
+def blk32_maxmed(cf):
+    """Per-block (1x32 along the last dim) max|x| / median|x| of float32 cf, median = mean of the
+    16th and 17th smallest |x|. All-zero blocks are skipped; a zero median counts as +inf (top bin
+    and above every threshold). Returns (n_blocks, histogram of log2(ratio) [_BLK_BINS],
+    {threshold: number of blocks with ratio > threshold})."""
+    a = _blocks(cf, _BLK).abs()
+    live = a.amax(-1) > 0
+    s = a[live].sort(-1).values
+    med = 0.5 * (s[:, _BLK // 2 - 1] + s[:, _BLK // 2])
+    r = torch.where(med > 0, s[:, -1] / med.clamp(min=1e-38), torch.full_like(med, float("inf")))
+    idx = (torch.log2(r) * (_BLK_BINS / _MM_LOG2_MAX)).clamp(0, _BLK_BINS - 1).long()
+    hist = torch.bincount(idx, minlength=_BLK_BINS).double()
+    return (live.sum(dtype=torch.float64), hist,
+            {t: (r > t).sum(dtype=torch.float64) for t in _MM_THRESH})
+
+
+def _mx_scaled(x):
+    """x [..., D] (training dtype) -> (blocks of x in fp32, blocks of x / 2^e) with the e8m0
+    exponent e of the training emulation (scale rule "alto", 1x32 along D, amax in x's dtype)."""
+    from megatron.core.mxfp4_emulation import scale_exponent
+    xb = _blocks(x, _BLK)
+    e = scale_exponent(xb.abs().amax(-1, keepdim=True), "alto")
+    xf = xb.float()
+    return xf, xf * torch.exp2(-e), torch.exp2(e)
+
+
+def mx_round_stats(y):
+    """Rounding of scaled MXFP4 blocks y (= x / 2^e) as the training emulation does it:
+    elements clamp at 6, then round onto {0, .5, 1, 1.5, 2, 3, 4, 6}, to nearest (forward) or
+    stochastically (gradients, recipe alto). Per element, in units of the block scale:
+      rn_flush  RN sends a non-zero value to 0 (|y| <= 0.25, a tie rounds to the even code 0)
+      sr_pzero  probability that SR sends it to 0: 1 - |y| / 0.5 for |y| < 0.5, else 0
+      sr_var    SR variance (a - lo)(hi - a) plus the clamp error above 6 (SR is unbiased
+                below 6, so this is its whole mean-square error)
+      rn_err2   RN squared error
+    Returns per-element tensors (nonzero mask, rn_flush mask, sr_pzero, sr_var, rn_err2); the
+    last two are in units of scale^2 (the caller multiplies by the block scale squared)."""
+    a = y.abs()
+    nz = a > 0
+    ac = a.clamp(max=6.0)
+    step = torch.where(ac < 2, 0.5, torch.where(ac < 4, 1.0, 2.0))
+    lo = torch.floor(ac / step) * step
+    sr_var = (ac - lo) * (lo + step - ac) + (a - ac) ** 2
+    rn = torch.round(ac / step) * step
+    rn_err2 = (rn - a) ** 2
+    rn_flush = nz & (ac <= 0.25)
+    sr_pzero = torch.where(nz & (ac < 0.5), 1.0 - 2.0 * ac, torch.zeros_like(ac))
+    return nz, rn_flush, sr_pzero, sr_var, rn_err2
+
+
+def _hist_quantile(h, q, lo=1.0, hi=float(_BLK)):
+    """q-quantile from a histogram over [lo, hi] (linear inside a bin); default: kappa over [1, 32]."""
+    tot = sum(h)
+    if tot <= 0:
+        return None
+    w, target, acc = (hi - lo) / len(h), q * tot, 0.0
+    for i, c in enumerate(h):
+        if c > 0 and acc + c >= target:
+            return lo + w * (i + (target - acc) / c)
+        acc += c
+    return hi
 
 
 def _round_e2m1(y):
@@ -184,7 +290,7 @@ class _Tracker:
         self.layer = 0
         self.num_slots = 2          # index 0 = model-level (logits), 1..L = layers
         self.num_experts = 1
-        self.sums, self.maxs, self.vecs = {}, {}, {}
+        self.sums, self.maxs, self.vecs, self.hists = {}, {}, {}, {}
         self.done = set()           # (site, layer) with once-per-step stats already taken
         self.fc1_in = None          # fc1 input of the GLU about to run (see stash_fc1_input)
         self.gen = None             # private RNG for stochastic rounding (training RNG untouched)
@@ -205,7 +311,7 @@ def begin_step(active, num_layers, num_experts=None):
     _T.active = bool(active)
     _T.num_slots = int(num_layers) + 2
     _T.num_experts = max(int(num_experts or 1), 1)
-    _T.sums.clear(); _T.maxs.clear(); _T.vecs.clear()
+    _T.sums.clear(); _T.maxs.clear(); _T.vecs.clear(); _T.hists.clear()
     _T.done.clear(); _T.fc1_in = None
 
 
@@ -244,6 +350,14 @@ def _vec(key, layer, v):
     t[_slot(layer), :n] += v[:n].double()
 
 
+def _hist(key, layer, h):
+    t = _T.hists.get(key)
+    if t is None:
+        t = _T.hists[key] = torch.zeros(_T.num_slots, _BLK_BINS, dtype=torch.float64,
+                                        device="cuda")
+    t[_slot(layer)] += h
+
+
 def _tensor_stats(prefix, layer, x, quant=False):
     x2 = x.detach().reshape(-1, x.shape[-1])
     if x2.numel() == 0:
@@ -267,7 +381,29 @@ def _tensor_stats(prefix, layer, x, quant=False):
         sq = cf * cf
         _add(prefix + "/sumsq", layer, sq.sum(dtype=torch.float64))
         _add(prefix + "/sum4", layer, (sq * sq).sum(dtype=torch.float64))
+        del sq
+        n, ks, cs, km, hb = blk32_stats(cf)
+        _add(prefix + "/blk/n", layer, n)
+        _add(prefix + "/blk/ksum", layer, ks)
+        _add(prefix + "/blk/crsum", layer, cs)
+        _max(prefix + "/blk/kmax", layer, km)
+        _hist(prefix + "/blk/hist", layer, hb)
         if quant:
+            nm, hm, gt = blk32_maxmed(cf)
+            _add(prefix + "/mm/n", layer, nm)
+            _hist(prefix + "/mm/hist", layer, hm)
+            for t, v in gt.items():
+                _add(f"{prefix}/mm/gt{t:g}", layer, v)
+            # MXFP4 as the training emulation does it (alto scale, RN forward / SR gradients)
+            _, y, s = _mx_scaled(c)
+            nz, fl, pz, var, e2 = mx_round_stats(y)
+            s2 = s * s
+            _add(f"{prefix}/mxa/nonzero", layer, nz.sum(dtype=torch.float64))
+            _add(f"{prefix}/mxa/rn_flushed", layer, fl.sum(dtype=torch.float64))
+            _add(f"{prefix}/mxa/sr_pzero", layer, pz.sum(dtype=torch.float64))
+            _add(f"{prefix}/mxa/sr_errsq", layer, (var * s2).sum(dtype=torch.float64))
+            _add(f"{prefix}/mxa/rn_errsq", layer, (e2 * s2).sum(dtype=torch.float64))
+            del y, nz, fl, pz, var, e2
             for fmt in FORMATS:
                 xb, q = fake_quant(cf, fmt, tmax)
                 nz = xb != 0
@@ -312,6 +448,19 @@ def _unit_stats(site, layer, z2, h, gate_fn, tokens_per_expert):
                 else gate_fn(zg)
             (gp,) = torch.autograd.grad(gv.sum(), zg)
         agp = gp.abs()
+        # dead zone relative to each block's own largest slope (1x32 along the hidden units of
+        # one token = the dgrad block layout of dz2), with the real e8m0 scale: RN flush and
+        # the probability that SR sends the slope factor to 0. Plus the mean block-max slope.
+        _, ys, _ = _mx_scaled(gp)
+        nzs, fls, pzs, _, _ = mx_round_stats(ys)
+        _add(f"{site}/z2/fpblk_n", layer, nzs.sum(dtype=torch.float64))
+        _add(f"{site}/z2/fpblk_rn", layer, fls.sum(dtype=torch.float64))
+        _add(f"{site}/z2/fpblk_sr", layer, pzs.sum(dtype=torch.float64))
+        bmax = _blocks(agp, _BLK).amax(-1)
+        _add(f"{site}/z2/fpblk_max_sum", layer, bmax.sum(dtype=torch.float64))
+        _add(f"{site}/z2/fpblk_blocks", layer, float(bmax.numel()))
+        _add(f"{site}/z2/fpblk_max_gt1", layer, (bmax > 1).sum(dtype=torch.float64))
+        del ys, nzs, fls, pzs, bmax
         for k, fl in FLOORS.items():
             m = (agp < fl).float()
             _add(f"{site}/z2/deadzone_{k}", layer, m.sum(dtype=torch.float64))
@@ -540,16 +689,28 @@ def record_router(layer_number, routing_map):
 
 # ---- reduction + logging -----------------------------------------------------
 def _union_keys():
-    mine = (sorted(_T.sums), sorted(_T.maxs), sorted(_T.vecs))
+    mine = (sorted(_T.sums), sorted(_T.maxs), sorted(_T.vecs), sorted(_T.hists))
     if not (dist.is_available() and dist.is_initialized()):
         return mine
     allk = [None] * dist.get_world_size()
     dist.all_gather_object(allk, mine)
-    return tuple(sorted(set().union(*[k[i] for k in allk])) for i in range(3))
+    return tuple(sorted(set().union(*[k[i] for k in allk])) for i in range(4))
 
 
 def _reduced():
-    ks, km, kv = _union_keys()
+    ks, km, kv, kh = _union_keys()
+    for k in kh:
+        if k not in _T.hists:
+            _T.hists[k] = torch.zeros(_T.num_slots, _BLK_BINS, dtype=torch.float64, device="cuda")
+    if kh:
+        flat_h = torch.cat([_T.hists[k].flatten() for k in kh])
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(flat_h, op=dist.ReduceOp.SUM)
+        fh, L = flat_h.cpu().tolist(), _T.num_slots
+        H = {k: [fh[(j * L + l) * _BLK_BINS:(j * L + l + 1) * _BLK_BINS] for l in range(L)]
+             for j, k in enumerate(kh)}
+    else:
+        H = {}
     for k in ks:
         if k not in _T.sums:
             _T.sums[k] = torch.zeros(_T.num_slots, dtype=torch.float64, device="cuda")
@@ -578,12 +739,14 @@ def _reduced():
         V[k] = [fs[o + i * E:o + (i + 1) * E] for i in range(L)]; o += L * E
     for i, k in enumerate(km):
         M[k] = fm[i * L:(i + 1) * L]
+    V["__hist__"] = H
     return S, M, V
 
 
 def _metrics(S, M, V):
     """-> {(site, metric): {slot: value}} for every slot with data."""
     out = {}
+    H = V.pop("__hist__", {})
 
     def put(site, metric, slot, val):
         if val is not None and math.isfinite(val):
@@ -604,6 +767,30 @@ def _metrics(S, M, V):
             if rms > 0:
                 put(site, f"{tensor}/crest", l, amax / rms)
                 put(site, f"{tensor}/kurtosis", l, (S[prefix + "/sum4"][l] / c) / ms ** 2)
+            nb = S.get(prefix + "/blk/n")
+            if nb is not None and nb[l] > 0:          # per-block (1x32) kurtosis / crest
+                put(site, f"{tensor}/blk32_kurtosis", l, S[prefix + "/blk/ksum"][l] / nb[l])
+                put(site, f"{tensor}/blk32_amax_over_rms", l, S[prefix + "/blk/crsum"][l] / nb[l])
+                put(site, f"{tensor}/blk32_kurtosis_max", l, M[prefix + "/blk/kmax"][l])
+                h = H.get(prefix + "/blk/hist")
+                if h is not None:
+                    for q, name in ((0.5, "p50"), (0.9, "p90"), (0.99, "p99")):
+                        put(site, f"{tensor}/blk32_kurtosis_{name}", l, _hist_quantile(h[l], q))
+                    w = (_BLK - 1.0) / _BLK_BINS
+                    tot = sum(h[l])
+                    for t in _BLK_THRESH:          # thresholds sit on bin edges
+                        i0 = int(round((t - 1.0) / w))
+                        put(site, f"{tensor}/blk32_frac_kurt_gt{t:g}", l, sum(h[l][i0:]) / tot)
+            nm = S.get(prefix + "/mm/n")              # per-block max / median
+            if nm is not None and nm[l] > 0:
+                h = H.get(prefix + "/mm/hist")
+                if h is not None:
+                    for q, name in ((0.5, "p50"), (0.9, "p90"), (0.99, "p99")):
+                        v = _hist_quantile(h[l], q, 0.0, _MM_LOG2_MAX)
+                        put(site, f"{tensor}/blk32_max_over_median_{name}", l,
+                            None if v is None else 2.0 ** v)
+                for t in _MM_THRESH:
+                    put(site, f"{tensor}/blk32_frac_maxmed_gt{t:g}", l, S[f"{prefix}/mm/gt{t:g}"][l] / nm[l])
             mn = S.get(prefix + "/mom_n")
             if mn is not None and mn[l] > 0:
                 put(site, f"{tensor}/max_over_median", l, S[prefix + "/mom_sum"][l] / mn[l])
@@ -612,6 +799,14 @@ def _metrics(S, M, V):
             if blk is not None and blk[l] > 0:
                 for k in ("scale_underflow", "scale_subnormal"):
                     put(site, f"{tensor}/nvfp4_{k}", l, S[f"{prefix}/nvfp4/{k}"][l] / blk[l])
+            nz = S.get(f"{prefix}/mxa/nonzero")     # MXFP4 exactly as trained (alto scale)
+            if nz is not None and nz[l] > 0:
+                put(site, f"{tensor}/mxfp4alto_rn_flush", l, S[f"{prefix}/mxa/rn_flushed"][l] / nz[l])
+                put(site, f"{tensor}/mxfp4alto_sr_zero_prob", l, S[f"{prefix}/mxa/sr_pzero"][l] / nz[l])
+                if S[prefix + "/sumsq"][l] > 0:
+                    for r in ("rn", "sr"):
+                        put(site, f"{tensor}/mxfp4alto_{r}_relerr", l,
+                            math.sqrt(S[f"{prefix}/mxa/{r}_errsq"][l] / S[prefix + "/sumsq"][l]))
             for fmt in FORMATS:
                 nz = S.get(f"{prefix}/{fmt}/nonzero")
                 if nz is None or nz[l] <= 0:
@@ -624,6 +819,14 @@ def _metrics(S, M, V):
     for site in GLU_SITES:
         for t in GLU_TENSORS:
             moments(site, t, f"{site}/{t}")
+        fn_, fb_ = S.get(f"{site}/z2/fpblk_n"), S.get(f"{site}/z2/fpblk_blocks")
+        for l in range(len(fn_ or [])):
+            if fn_[l] > 0:
+                put(site, "deadzone_fp4blk_rn", l, S[f"{site}/z2/fpblk_rn"][l] / fn_[l])
+                put(site, "deadzone_fp4blk_sr", l, S[f"{site}/z2/fpblk_sr"][l] / fn_[l])
+            if fb_ is not None and fb_[l] > 0:
+                put(site, "deadzone_ref_slope_blkmax", l, S[f"{site}/z2/fpblk_max_sum"][l] / fb_[l])
+                put(site, "deadzone_ref_frac_blkmax_gt1", l, S[f"{site}/z2/fpblk_max_gt1"][l] / fb_[l])
         zc, units = S.get(f"{site}/z2/count"), S.get(f"{site}/units")
         for k in FLOORS:
             dz, du = S.get(f"{site}/z2/deadzone_{k}"), S.get(f"{site}/dead_units_{k}")
@@ -652,6 +855,12 @@ def _metrics(S, M, V):
                     ref = S[f"{site}/{base}/refsq"][l]
                     if ref > 0:
                         put(site, f"{base}_relerr", l, math.sqrt(S[key][l] / ref))
+                    dot, apx = S.get(f"{site}/{base}/dot"), S.get(f"{site}/{base}/apxsq")
+                    if dot is not None and ref > 0 and apx[l] > 0:   # emulated MXFP4 GEMMs
+                        put(site, f"{base}_cos", l, dot[l] / math.sqrt(ref * apx[l]))
+                        put(site, f"{base}_proj", l, dot[l] / ref)
+                        if S[key][l] > 0:
+                            put(site, f"{base}_snr", l, math.sqrt(ref / S[key][l]))
                     if rest.startswith("wq/") and S[f"{site}/{base}/nonzero"][l] > 0:
                         put(site, f"{base}_flush", l,
                             S[f"{site}/{base}/flushed"][l] / S[f"{site}/{base}/nonzero"][l])
@@ -706,6 +915,16 @@ _PER_LAYER = {
     "gemm/fc1_wgrad_nvfp4_relerr", "wq/fc1_nvfp4_relerr", "wq/fc2_nvfp4_relerr",
     "align/w_cos_abs_mean", "align/z_corr_abs_mean", "h/och_outlier_frac",
     "h/och_p90_over_median", "h/och_top1pct_energy",
+    "h/blk32_kurtosis", "h/blk32_kurtosis_p99", "h/blk32_frac_kurt_gt8",
+    "dz2/blk32_kurtosis", "dz2/blk32_kurtosis_p99", "dz1/blk32_kurtosis", "x/blk32_kurtosis",
+    "deadzone_fp4blk_rn", "deadzone_fp4blk_sr", "deadzone_ref_slope_blkmax",
+    "dz2/mxfp4alto_sr_zero_prob", "dz2/mxfp4alto_sr_relerr",
+    "h/mxfp4alto_rn_flush", "h/mxfp4alto_rn_relerr",
+    *(f"{t}/blk32_{m}" for t in ("h", "dz2") for m in (
+        "max_over_median_p50", "max_over_median_p90", "max_over_median_p99",
+        "frac_maxmed_gt16", "frac_maxmed_gt28")),
+    *(f"gemm/mx_{lin}_{st}_{m}" for lin in ("fc1", "fc2")
+      for st in ("fprop", "dgrad", "wgrad", "wgradstep") for m in ("relerr", "cos", "proj", "snr")),
 }
 _PREFIX_SECTION = {"gemm/": "gemm-quant", "wq/": "weight-quant", "align/": "gate-align",
                    "param/": "learned-gate"}
@@ -718,7 +937,9 @@ def _tag(site, metric):
     for pre, sec in _PREFIX_SECTION.items():
         if metric.startswith(pre):
             return sec, f"{site}/{metric[len(pre):]}"
-    if metric.endswith(("_flush", "_relerr", "_underflow", "_subnormal")):
+    if "blk32_" in metric:
+        return "gate-blk32", f"{site}/{metric.replace('/', '_')}"
+    if metric.endswith(("_flush", "_relerr", "_underflow", "_subnormal", "_zero_prob")):
         section = "gate-quant"
     elif metric.startswith(("deadzone", "dead_units")):
         section = "gate-deadzone"
@@ -734,6 +955,11 @@ def reduce_and_log(iteration, writer=None, wandb_writer=None):
     """All ranks must call this on the same iterations. Writes layer-average + per-layer tags."""
     if not _T.active:
         return
+    import sys
+    mx = sys.modules.get("megatron.core.mxfp4_emulation")
+    if mx is not None:          # full-step weight-gradient error of the emulated MXFP4 GEMMs
+        with torch.no_grad():
+            mx.flush_step_stats(_add)
     _T.active = False
     S, M, V = _reduced()
     metrics = _metrics(S, M, V)
@@ -780,6 +1006,14 @@ def reduce_and_log(iteration, writer=None, wandb_writer=None):
               f"{g('gemm-quant/routed/fc1_wgrad_nvfp4_plain_relerr')}) | w-align "
               f"{g('gate-align/routed/w_cos_abs_mean')} z-corr "
               f"{g('gate-align/routed/z_corr_abs_mean')} | h max/median "
-              f"{g('gate-outliers/routed/h_max_over_median')}",
+              f"{g('gate-outliers/routed/h_max_over_median')} | blk32 kurt h mean/p99 "
+              f"{g('gate-blk32/routed/h_blk32_kurtosis')}/{g('gate-blk32/routed/h_blk32_kurtosis_p99')}"
+              f" dz2 {g('gate-blk32/routed/dz2_blk32_kurtosis')}/"
+              f"{g('gate-blk32/routed/dz2_blk32_kurtosis_p99')} | routed deadzone fp4 floor/blk-rn/"
+              f"blk-sr {g('gate-deadzone/routed/deadzone_fp4')}/"
+              f"{g('gate-deadzone/routed/deadzone_fp4blk_rn')}/{g('gate-deadzone/routed/deadzone_fp4blk_sr')}"
+              f" slope blkmax {g('gate-deadzone/routed/deadzone_ref_slope_blkmax')} | dz2 alto SR "
+              f"p0 {g('gate-quant/routed/dz2_mxfp4alto_sr_zero_prob')} relerr "
+              f"{g('gate-quant/routed/dz2_mxfp4alto_sr_relerr')}",
               flush=True)
     return scalars
