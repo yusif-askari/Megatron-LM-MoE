@@ -1,5 +1,8 @@
 """Learnable activation-sweep gates (exp_pglu / exp_xrlglu) and their --log-glu-stats hooks.
 
+exp_pglu evaluates in fp32 from an fp32 coefficient table (p = softplus(rho), b and derived constants;
+see the pglu section of exp_gates.py), so its tolerances are fp32-level even for fp64 inputs.
+
 Self-contained (loads exp_gates.py / glu_stats.py by path); needs one GPU:
     srun ... python tests/unit_tests/transformer/test_exp_learnable_gates.py
 """
@@ -25,6 +28,7 @@ def _load(name, path):
 gs = _load("glu_stats", os.path.join(REPO, "megatron/core/transformer/glu_stats.py"))
 eg = _load("exp_gates", os.path.join(REPO, "megatron/core/exp_gates.py"))
 DEV = "cuda"
+D = torch.float64
 X = torch.linspace(-12, 12, 4001, dtype=torch.float64)
 
 
@@ -50,41 +54,102 @@ def test_pglu_derivative_and_zero():
             (gx,) = torch.autograd.grad(y.sum(), x)
             pp, bb = F.softplus(m.raw_p).item(), m.b.item()     # the fp32-stored init values
             ref = (1 + (X - bb).abs()) ** (-pp)
-            assert (gx - ref).abs().max() < 1e-9, (p, b)
+            assert ((gx - ref).abs() / ref).max() < 2e-6, (p, b)
             assert abs(_pglu(p, b)(torch.zeros(1, dtype=torch.float64)).item()) < 1e-12
+            xb = torch.tensor([bb], dtype=torch.float64, requires_grad=True)      # slope 1 at x = b
+            (sb,) = torch.autograd.grad(m(xb).sum(), xb)
+            assert sb.item() == 1.0, (p, b, sb.item())
 
 
-def test_pglu_param_grads_finite_at_p1():
-    """The former where(p==1, log, pow) form gave a NaN dL/dp at p=1 and a zero one nearby."""
+def _bump_integral64(u, p):
+    """F_p(u) in fp64 as G(u) for u >= 0 and -G(-u) for u < 0, G(t) = l exprel((1-p) l), l = ln(1+t):
+    autograd gives the true slope 1 at u = 0."""
+    def G(t):
+        l = torch.log1p(t)
+        z = (1.0 - p) * l
+        small = z.abs() < 1e-6
+        zs = torch.where(small, torch.ones_like(z), z)
+        return l * torch.where(small, 1.0 + z * (0.5 + z / 6.0), torch.expm1(zs) / zs)
+    zero = torch.zeros_like(u)
+    return torch.where(u >= 0, G(torch.where(u >= 0, u, zero)), -G(torch.where(u < 0, -u, zero)))
+
+
+def _truth(y, prob, raw_p, b, counts):
+    """fp64 autograd of h = (F_p(g - b) - F_p(-b)) * v * prob over expert segments."""
+    y64 = y.double().detach().requires_grad_()
+    pr64 = prob.double().detach().requires_grad_()
+    rp64 = raw_p.double().detach().requires_grad_()
+    b64 = b.double().detach().requires_grad_()
+    c = torch.as_tensor(counts, device=y.device)
+    p = torch.repeat_interleave(F.softplus(rp64), c).unsqueeze(-1)
+    br = torch.repeat_interleave(b64, c).unsqueeze(-1)
+    g, v = y64.chunk(2, -1)
+    h = (_bump_integral64(g - br, p) - _bump_integral64(-br, p)) * v * pr64
+    return h, (y64, pr64, rp64, b64)
+
+
+def test_pglu_param_grads_at_p1():
+    """dL/drho, dL/db finite and right at and next to p = 1 (the old where(p==1, log, pow) form gave a NaN
+    dL/dp at p = 1), from the gate alone (forward) against the fp64 truth."""
     for p in (1.0, 1.00005, 0.99995):
         m = _pglu(p, 1.0)
-        y = m(X).sum()
-        y.backward()
+        m(X).sum().backward()
         gp, gb = m.raw_p.grad.item(), m.b.grad.item()
-        assert math.isfinite(gp) and math.isfinite(gb) and abs(gp) > 1e-3, (p, gp, gb)
-        # central finite difference in raw_p
-        eps = 1e-6
-        with torch.no_grad():
-            r0 = m.raw_p.item()
-            m.raw_p.fill_(r0 + eps); up = m(X).sum().item()
-            m.raw_p.fill_(r0 - eps); dn = m(X).sum().item()
-        fd = (up - dn) / (2 * eps)
-        assert abs(gp - fd) / abs(fd) < 1e-5, (p, gp, fd)
+        rp, bb = m.raw_p.detach().float(), m.b.detach().float()
+        h, (_, _, rp64, b64) = _truth(torch.stack([X, torch.ones_like(X)], -1), torch.ones(len(X), 1, dtype=D),
+                                      rp, bb, [len(X)])
+        h.sum().backward()
+        assert math.isfinite(gp) and math.isfinite(gb)
+        assert abs(gp - rp64.grad.item()) <= 1e-5 * abs(rp64.grad.item()), (p, gp, rp64.grad.item())
+        assert abs(gb - b64.grad.item()) <= 1e-5 * abs(b64.grad.item()), (p, gb, b64.grad.item())
 
 
 def test_pglu_series_branch_continuous():
-    """Value is continuous across the |z| = 1e-3 series/exact switch of exprel."""
+    """Value continuous across the |z| = 0.5 series / closed-form switch of exprel (and its phi)."""
     x = torch.tensor([3.0], dtype=torch.float64)
     l = math.log1p(3.0)
-    vals = []
-    for z in (0.999e-3, 1.001e-3):
+    for z in (0.4999, 0.5001, -0.4999, -0.5001):
         m = _pglu(1.0, 0.0)
-        with torch.no_grad():                                 # set p = 1 - z/l exactly
+        with torch.no_grad():                                 # set p = 1 - z/l
             m.raw_p.fill_(math.log(math.expm1(1.0 - z / l)))
-        q = 1.0 - F.softplus(m.raw_p).item()
-        vals.append(m(x).item())
+        q = 1.0 - F.softplus(m.raw_p.float()).double().item()
         exact = ((1 + 3.0) ** q - 1) / q
-        assert abs(vals[-1] - exact) < 1e-12, (q, vals[-1], exact)
+        assert abs(m(x).item() - exact) < 2e-6 * abs(exact), (z, m(x).item(), exact)
+
+
+def test_pglu_weighted_glu_vs_fp64():
+    """The training path h = bf16(g(y_gate) y_value prob) (one rounding, analytic backward) over 8 experts with
+    uneven counts (one empty), p = 1 exactly and near it, b = 0 and negative, 2% of gate inputs exactly at b."""
+    torch.manual_seed(0)
+    counts = [0, 37, 128, 300, 5, 248, 129, 64]
+    n, f, E = sum(counts), 256, len(counts)
+    y = (torch.randn(n, 2 * f, device=DEV) * 2.0).bfloat16()
+    p_vals = torch.tensor([1.0, 0.3, 2.5, 1.0001, 0.999, 1.6, 1.0, 4.0], device=DEV)
+    b_vals = torch.tensor([1.0, 0.0, -0.7, 3.0, 1.3, 0.25, 1.0, 6.0], device=DEV)
+    raw_p, b = torch.log(torch.expm1(p_vals)), b_vals
+    br = torch.repeat_interleave(b, torch.tensor(counts, device=DEV)).unsqueeze(-1).expand(n, f)
+    tie = torch.rand(n, f, device=DEV) < 0.02
+    y[:, :f][tie] = br[tie].bfloat16()
+    prob = torch.rand(n, 1, device=DEV) * 0.3
+    dh = (torch.randn(n, f, device=DEV) * 1e-2).bfloat16()
+    m = eg.ExpPGLU(num_local_experts=E).to(DEV)
+    with torch.no_grad():
+        m.raw_p.copy_(raw_p); m.b.copy_(b)
+    yy, pr = y.clone().requires_grad_(True), prob.clone().requires_grad_(True)
+    h = m.weighted_glu(yy, pr, counts)
+    assert h.dtype == torch.bfloat16
+    h.backward(dh)
+    h_t, leaves = _truth(y, prob, raw_p, b, counts)
+    h_t.backward(dh.double())
+    rel = lambda a, r: ((a.double() - r).norm() / r.norm()).item()
+    # one rounding: h differs from bf16(truth) only at rounding ties, by one bf16 ulp (GH200: ~3e-4 of entries)
+    assert (h != h_t.to(torch.bfloat16)).float().mean().item() < 5e-4
+    assert rel(yy.grad, leaves[0].grad) < 1.8e-3
+    assert rel(pr.grad, leaves[1].grad) < 1e-5
+    assert rel(m.raw_p.grad, leaves[2].grad) < 1e-5
+    assert rel(m.b.grad, leaves[3].grad) < 1e-5
+    assert m.raw_p.grad[0].item() == 0.0 and m.b.grad[0].item() == 0.0          # empty expert
+    assert m.raw_p.dtype == torch.float32 and m.raw_p.keep_fp32 and m.b.keep_fp32
 
 
 def test_xrlglu_alpha0_is_rlglu_and_tails():
@@ -156,11 +221,28 @@ def test_bf16_io_and_compiled_matches_eager():
         assert y.dtype == torch.bfloat16
         ref = m(x.double(), tpe)
         assert ((y.double() - ref).abs() / (ref.abs() + 1)).max() < 1e-2
+    # pglu: its fused forward / backward functions, eager against torch.compile
+    m = eg.ExpPGLU(num_local_experts=2).to(DEV)
+    cr = eg._rows(eg.pglu_coefficients(m.raw_p, m.b), tpe, x.shape[0])
+    v = (torch.randn_like(x.float()) * 2).bfloat16()
+    pr = torch.rand(x.shape[0], 1, device=DEV)
+    dh = torch.randn_like(x)
+    he, hc = eg._pglu_fwd(x, v, cr, pr), torch.compile(eg._pglu_fwd, dynamic=True)(x, v, cr, pr)
+    assert (he != hc).float().mean().item() < 1e-3 and (he.float() - hc.float()).abs().max() < 2e-2
+    be = eg._pglu_bwd(dh, x, v, cr, pr)
+    bc = torch.compile(eg._pglu_bwd, dynamic=True)(dh, x, v, cr, pr)
+    for a, b in zip(be, bc):
+        assert torch.isfinite(b.float()).all()
+        assert ((a.float() - b.float()).norm() / a.float().norm()) < 1e-3
+    for cls in (eg.ExpXRLGLU,):
+        m = cls(num_local_experts=2).to(DEV)
+        with torch.no_grad():
+            for prm in m.parameters():
+                prm.add_(torch.tensor([0.1, -0.2], device=DEV))
         # the training path wraps the math in torch.compile (megatron jit_fuser)
-        fn = eg._pglu if cls is eg.ExpPGLU else eg._xrlglu
+        fn = eg._xrlglu
         cfn = torch.compile(fn, dynamic=True)
-        args = ([F.softplus(m._rows(m.raw_p, x, tpe)), m._rows(m.b, x, tpe)]
-                if cls is eg.ExpPGLU else [m._rows(m.alpha, x, tpe)])
+        args = [m._rows(m.alpha, x, tpe)]
         xe = x.clone().requires_grad_(True); xc = x.clone().requires_grad_(True)
         ye, yc = fn(xe, *args), cfn(xc, *args)
         assert (ye.float() - yc.float()).abs().max() < 2e-2

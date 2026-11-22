@@ -572,6 +572,31 @@ class TEGroupedMLP(MegatronModule):
                     x_glu, x_linear, tokens_per_expert=tokens_per_expert, scores=permuted_probs
                 )
                 probs_fused = True
+            elif (self.config.gated_linear_unit and self.config.exp_learnable_gate is not None
+                  and hasattr(self.exp_gate, "weighted_glu")):
+                # --exp-gate exp_pglu: h = bf16(g(y_gate) y_value prob) in fp32, rounded once,
+                # analytic backward, per-expert dL/drho, dL/db (exp_gates.ExpPGLU)
+                y = intermediate_parallel
+                val = self.config.activation_func_clamp_value
+                stats = glu_stats.is_active()
+                if val is not None or self.config.glu_linear_offset != 0.0 or stats:
+                    x_glu, x_linear = torch.chunk(y, 2, dim=-1)
+                    if val is not None:
+                        x_glu = x_glu.clamp(min=None, max=val)
+                        x_linear = x_linear.clamp(min=-val, max=val)
+                    if self.config.glu_linear_offset != 0.0:
+                        x_linear = x_linear + self.config.glu_linear_offset
+                    y = torch.cat([x_glu, x_linear], dim=-1)
+                h = self.exp_gate.weighted_glu(y, permuted_probs, tokens_per_expert)
+                if stats:  # --log-glu-stats, logging steps only
+                    with torch.no_grad():
+                        gate = self.exp_gate(x_glu, tokens_per_expert)
+                        out = gate * x_linear
+                    glu_stats.record_glu("routed", x_linear, x_glu, gate, out,
+                                         self.exp_gate, tokens_per_expert,
+                                         fc1_out=intermediate_parallel, module=self)
+                intermediate_parallel = h
+                probs_fused = True
             elif (self.config.gated_linear_unit and self.config.exp_learnable_gate is None
                   and hasattr(self.config.activation_func, "weighted_glu")):
                 # --exp-gate bump gates (exp_gates.BumpGate): h = bf16(g(x_glu) x_linear prob)

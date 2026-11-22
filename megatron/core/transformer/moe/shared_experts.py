@@ -212,7 +212,13 @@ class SharedExpertMLP(MLP):
                 if self.config.gated_linear_unit:
 
                     def glu(x):
+                        gate = getattr(self, "exp_gate", None)               # --exp-gate learnable
+                        if gate is not None and hasattr(gate, "weighted_glu"):  # exp_pglu
+                            lead = x.shape[:-1]
+                            return gate.weighted_glu(x.reshape(-1, x.shape[-1])).reshape(*lead, -1)
                         x = torch.chunk(x, 2, dim=-1)
+                        if gate is not None:                                  # exp_xrlglu
+                            return gate(x[0]) * x[1]
                         if hasattr(self.config.activation_func, "weighted_glu"):  # bump gates
                             return self.config.activation_func.weighted_glu(x[0], x[1])
                         return self.config.activation_func(x[0]) * x[1]
