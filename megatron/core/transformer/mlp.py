@@ -287,6 +287,13 @@ class MLP(MegatronModule):
             self.xr2glu = XR2GLU(num_local_experts=1, config=self.config)
         if self.config.xssglu:
             self.xssglu_glu = XSSGLU(num_local_experts=1, config=self.config)
+        # --exp-gate exp_pglu: a single (p, b) per MLP (megatron/core/exp_gates.py).
+        if self.config.exp_learnable_gate is not None:
+            from megatron.core.exp_gates import LEARNABLE_GATES
+
+            self.exp_gate = LEARNABLE_GATES[self.config.exp_learnable_gate](
+                config=self.config, num_local_experts=1
+            )
         if self.config.polynorm:
             self.polynorm_act = PolyNormAct(
                 num_local_experts=1, config=self.config, tp_group=self.tp_group
@@ -426,7 +433,16 @@ class MLP(MegatronModule):
             # When PolyNorm fuses the per_token_scale multiply into its kernel we skip the
             # eager post-multiply below (the fc2-bias scaling further down still uses per_token_scale).
             scale_fused = False
-            if self.config.gated_linear_unit and (self.config.pnglu or self.config.pn3glu):
+            if self.config.exp_learnable_gate is not None:
+                # --exp-gate exp_pglu: h = bf16(gate(y_gate) * y_value [* per_token_scale]), one rounding
+                scores = per_token_scale.unsqueeze(-1) if per_token_scale is not None else None
+                lead = intermediate_parallel.shape[:-1]
+                intermediate_parallel = self.exp_gate.weighted_glu(
+                    intermediate_parallel.reshape(-1, intermediate_parallel.shape[-1]),
+                    None if scores is None else scores.reshape(-1, 1),
+                ).reshape(*lead, -1)
+                scale_fused = per_token_scale is not None
+            elif self.config.gated_linear_unit and (self.config.pnglu or self.config.pn3glu):
                 x_glu, x_linear = torch.chunk(intermediate_parallel, 2, dim=-1)
                 if (val := self.config.activation_func_clamp_value) is not None:
                     x_glu = x_glu.clamp(min=None, max=val)

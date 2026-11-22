@@ -235,6 +235,7 @@ class TEGroupedMLP(MegatronModule):
 
         self.ep_group = pg_collection.ep
         self.tp_group = pg_collection.expt_tp
+        self.expt_dp_group = getattr(pg_collection, 'expt_dp', None)
 
         # Double the output width with gated linear unit, see https://arxiv.org/pdf/2002.05202.pdf
         ffn_hidden_size = not_none(self.config.moe_ffn_hidden_size)
@@ -297,6 +298,14 @@ class TEGroupedMLP(MegatronModule):
         if self.config.xssglu:
             self.xssglu_glu = XSSGLU(
                 num_local_experts=self.num_local_experts, config=self.config
+            )
+        # --exp-gate exp_pglu: one (p, b) per local expert, mapped onto the expert-sorted rows
+        # via tokens_per_expert (megatron/core/exp_gates.py).
+        if self.config.exp_learnable_gate is not None:
+            from megatron.core.exp_gates import LEARNABLE_GATES
+
+            self.exp_gate = LEARNABLE_GATES[self.config.exp_learnable_gate](
+                config=self.config, num_local_experts=self.num_local_experts
             )
         if self.config.polynorm:
             self.polynorm_act = PolyNormAct(
@@ -473,7 +482,14 @@ class TEGroupedMLP(MegatronModule):
             # When PolyNorm fuses the permuted_probs multiply into its kernel we skip the
             # eager post-multiply below.
             probs_fused = False
-            if self.config.gated_linear_unit and (self.config.pnglu or self.config.pn3glu):
+            if self.config.exp_learnable_gate is not None:
+                # --exp-gate exp_pglu: h = bf16(gate(y_gate) * y_value * prob), one rounding
+                assert bias_parallel is None, "exp_learnable_gate: fc1 bias is not supported"
+                intermediate_parallel = self.exp_gate.weighted_glu(
+                    intermediate_parallel, permuted_probs, tokens_per_expert
+                )
+                probs_fused = True
+            elif self.config.gated_linear_unit and (self.config.pnglu or self.config.pn3glu):
                 x_glu, x_linear = torch.chunk(intermediate_parallel, 2, dim=-1)
                 if (val := self.config.activation_func_clamp_value) is not None:
                     x_glu = x_glu.clamp(min=None, max=val)
@@ -582,18 +598,19 @@ class TEGroupedMLP(MegatronModule):
         return intermediate_parallel
 
     def _fused_mxfp4_swiglu(self):
-        """True when the routed MLP is exactly fc1 -> weighted SwiGLU -> fc2 on the MXFP4 hardware
-        backend, so the fused forward (megatron/core/mxfp4_alto.py) computes the same thing."""
+        """True when the routed MLP is exactly fc1 -> weighted SwiGLU (or exp_pglu) -> fc2 on the MXFP4
+        hardware backend, so the fused kernels (megatron/core/mxfp4_alto.py) compute the same thing."""
         c = self.config
         if c.mxfp4_emulate is None or c.mxfp4_backend != 'alto':
             return False
         from megatron.core import mxfp4_alto
 
+        pglu = c.exp_learnable_gate == 'exp_pglu'
         return (
             mxfp4_alto.FUSED_SWIGLU
             and c.gated_linear_unit
             and self.activation_func == F.silu
-            and c.bias_activation_fusion
+            and (c.bias_activation_fusion or pglu)
             and not c.use_te_activation_func
             and c.activation_func_clamp_value is None
             and c.glu_linear_offset == 0.0
@@ -619,11 +636,21 @@ class TEGroupedMLP(MegatronModule):
             )
         return apply_module(linear)(x, tokens_per_expert)
 
+    def takes_token_perm(self):
+        """True when forward accepts tokens that are not sorted by expert (chunk_sort_args): the fused MXFP4
+        MLP with row maps (megatron/core/mxfp4_alto.py, MXFP4_SORT_FOLD)."""
+        if not self._fused_mxfp4_swiglu():
+            return False
+        from megatron.core import mxfp4_alto
+
+        return mxfp4_alto.SORT_FOLD and mxfp4_alto.ROW_MAP
+
     def forward(
         self,
         permuted_local_hidden_states: torch.Tensor,
         tokens_per_expert: torch.Tensor,
         permuted_probs: torch.Tensor,
+        chunk_sort_args=None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Forward of TEGroupedMLP
 
@@ -632,6 +659,9 @@ class TEGroupedMLP(MegatronModule):
             local experts.
             tokens_per_expert (torch.Tensor): The number of tokens per expert.
             permuted_probs (torch.Tensor): The permuted probs of each token produced by the router.
+            chunk_sort_args (optional): (split_sizes, sorted_idxs) of the dispatcher's sort by local expert
+            that was skipped (takes_token_perm): the tokens and probs are in the received order, and the
+            output is returned in that order.
 
         Return:
             output (torch.Tensor): The output of the local experts.
@@ -657,6 +687,7 @@ class TEGroupedMLP(MegatronModule):
                 or self.config.xr2glu
                 or self.config.xssglu
                 or self.config.polynorm
+                or self.config.exp_learnable_gate is not None
             ):
                 # These all have the same per-expert-coefficient repeat_interleave gradient
                 # exposure as PolyNorm (see the docstring below) -- zero their padding rows too.
@@ -680,16 +711,24 @@ class TEGroupedMLP(MegatronModule):
             permuted_probs = torch.ones_like(permuted_probs)
 
         if self._fused_mxfp4_swiglu():
-            # --mxfp4-backend alto: fc1 + weighted SwiGLU + fc2 with the fused forward kernel
+            # --mxfp4-backend alto: fc1 + weighted SwiGLU / pglu + fc2 on the fused kernels
             from megatron.core import mxfp4_alto
 
             n1, n2 = self.linear_fc1.num_gemms, self.linear_fc2.num_gemms
+            perm = None
+            if chunk_sort_args is not None:
+                perm = mxfp4_alto.chunk_order(
+                    *chunk_sort_args, permuted_local_hidden_states.shape[0],
+                    permuted_local_hidden_states.device, len(tokens_per_expert),
+                )
             output = mxfp4_alto.fused_swiglu_mlp(
                 permuted_local_hidden_states, tokens_per_expert, permuted_probs,
                 [getattr(self.linear_fc1, f"weight{i}") for i in range(n1)],
                 [getattr(self.linear_fc2, f"weight{i}") for i in range(n2)],
+                gate=getattr(self, "exp_gate", None), perm=perm,
             )
             return output, None
+        assert chunk_sort_args is None, "tokens not sorted by expert: only the fused MXFP4 MLP takes them"
 
         with off_interface(
             self.offload_expert_fc1, permuted_local_hidden_states, "expert_fc1"
@@ -755,7 +794,7 @@ class TEGroupedMLP(MegatronModule):
             module_sharded_offsets = sharded_offsets
             if name in (
                 'polynorm_glu', 'xpr_act', 'gxpr_glu', 'gxpry_glu', 'gxprv2_glu', 'xr2_act',
-                'gxr2_glu', 'xr2glu', 'xssglu_glu', 'polynorm_act',
+                'gxr2_glu', 'xr2glu', 'xssglu_glu', 'polynorm_act', 'exp_gate',
             ) and not singleton_local_shards:
                 # The PolyNorm/XPR/GXPR/XR2/GXR2/XR2GLU/XSSGLU/PolyNormAct coefficients are stored as a single
                 # (num_local_experts,) tensor. Prepend an expert-parallel sharding axis so this rank's coefficients
@@ -772,6 +811,14 @@ class TEGroupedMLP(MegatronModule):
             sub_sd = sharded_state_dict_default(
                 module, f'{name}.', module_sharded_offsets, metadata, tp_group=self.tp_group
             )
+            if module_sharded_offsets is not sharded_offsets and self.expt_dp_group is not None:
+                # The default replica_id uses the full data-parallel rank, but EP is carved out
+                # of DP: EP ranks > 0 would count as replicas and their coefficient shard would
+                # never be written. Replicas of an expert differ only in the expert-DP rank
+                # (as in SequentialMLP.sharded_state_dict). Ported from Megatron-LM-MoE.
+                for sh_ten in sub_sd.values():
+                    if hasattr(sh_ten, 'replica_id') and len(sh_ten.replica_id) == 3:
+                        sh_ten.replica_id = (*sh_ten.replica_id[:2], self.expt_dp_group.rank())
             if name == 'linear_fc1' and self.config.gated_linear_unit:
                 num_global_experts = self.ep_group.size() * self.num_local_experts
                 local_expert_indices_offset = self.ep_group.rank() * self.num_local_experts

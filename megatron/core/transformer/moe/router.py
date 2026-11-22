@@ -898,8 +898,7 @@ class TopKRouter(Router):
         else:
             return input
 
-    @jit_fuser
-    def _apply_expert_bias(
+    def _apply_expert_bias_eager(
         self, routing_map: torch.Tensor, padding_mask: Optional[torch.Tensor] = None
     ):
         """
@@ -911,6 +910,18 @@ class TopKRouter(Router):
                 if padding_mask is not None:
                     routing_map = routing_map & (~padding_mask.unsqueeze(-1))
                 self.local_tokens_per_expert += routing_map.sum(dim=0)
+
+    # The body is one column sum and one in-place add of integer counts. Compiled with torch.compile (jit_fuser) it
+    # is still two kernels, and every call first runs the compiled function's entry code on the host (guard checks,
+    # the AOT-autograd runtime wrapper). In the 5B run the GPU is idle during that entry code: 137 us before the
+    # first of the two kernels, 208 calls per training step (trace of job 535995, bench/kernel_gaps.5b-all.535995.txt).
+    # MOE_EAGER_EXPERT_BIAS=1 (default) calls the same body without torch.compile (same integer result); 0 restores
+    # the compiled call. 5B training step, 8 GPUs, median of steps 10-30 (job 536090): 3,020 -> 2,990 ms.
+    _apply_expert_bias = (
+        _apply_expert_bias_eager
+        if os.environ.get("MOE_EAGER_EXPERT_BIAS", "1") == "1"
+        else jit_fuser(_apply_expert_bias_eager)
+    )
 
     def _record_expert_load_samples(
         self, mbs_sample: torch.Tensor, seq_sample: Optional[torch.Tensor]

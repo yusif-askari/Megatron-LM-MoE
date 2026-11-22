@@ -431,6 +431,13 @@ def compute_qb_histogram(
     )
 
     num_experts = scores.shape[1]
+    from megatron.core.transformer.moe import triton_fast
+
+    if triton_fast.FAST_QB_HIST and scores.is_cuda and scores.dtype == torch.float32 and (
+        alpha.dtype == beta.dtype == torch.float32
+    ):
+        # MOE_FAST_QB_HIST=1: the same counts from one Triton kernel (triton_fast.qb_histogram)
+        return triton_fast.qb_histogram(scores, alpha, beta, num_bins, padding_mask)
     # We have a guarantee that r_{i, j} = alpha_i - scores_{i, j} is in [-beta.max() - 1, -beta.min() + 1], where beta.max and beta.min are the past values of beta.
     lower = -beta.max() - 1.0
     upper = -beta.min() + 1.0
@@ -683,9 +690,17 @@ def permute(
                 tokens, probs, routing_map, tokens_per_expert, align_size
             )
         else:
-            output, permuted_probs, row_id_map = fused_permute_with_probs(
-                tokens, probs, routing_map, num_out_tokens=num_out_tokens
-            )
+            from megatron.core.transformer.moe import triton_fast
+
+            if triton_fast.DIRECT_PERMUTE and triton_fast.direct_ok(tokens) and num_out_tokens:
+                # MOE_DIRECT_PERMUTE=1: TE's Triton permute without its custom-operator dispatch
+                output, permuted_probs, row_id_map = triton_fast.permute_with_probs(
+                    tokens, probs, routing_map, num_out_tokens
+                )
+            else:
+                output, permuted_probs, row_id_map = fused_permute_with_probs(
+                    tokens, probs, routing_map, num_out_tokens=num_out_tokens
+                )
             return output, permuted_probs, row_id_map, None, tokens_per_expert
 
     num_tokens, hidden = tokens.shape
@@ -778,6 +793,16 @@ def unpermute(
     if fused:
         if not HAVE_TE or fused_unpermute is None:
             raise ValueError("fused_unpermute is not available. Please install TE >= 2.1.0.")
+        from megatron.core.transformer.moe import triton_fast
+
+        if (
+            triton_fast.DIRECT_PERMUTE
+            and probs is None
+            and pad_offsets is None
+            and triton_fast.direct_ok(permuted_tokens)
+        ):
+            # MOE_DIRECT_PERMUTE=1: TE's Triton unpermute without its custom-operator dispatch
+            return triton_fast.unpermute(permuted_tokens, sorted_indices, restore_shape)
         extra_kwargs = {}
         if is_te_min_version("2.12.0"):
             extra_kwargs["pad_offsets"] = pad_offsets

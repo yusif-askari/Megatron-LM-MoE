@@ -325,6 +325,13 @@ class TransformerConfig(ModelParallelConfig):
     AMD ALTO's MXFP4 kernels (gfx950 only; recipe alto with scale rule alto;
     megatron/core/mxfp4_alto.py, ALTO checkout in $ALTO_DIR)."""
 
+    exp_learnable_gate: Optional[str] = None
+    """Name of a learnable activation-sweep gate from megatron/core/exp_gates.py (``exp_pglu``),
+    set by ``--exp-gate``. The MLPs compute h = bf16(gate(y_gate) * y_value * prob) with one
+    coefficient set per local expert (one per dense / shared MLP); on the MXFP4 alto backend the
+    fused fc1/fc2 kernels compute it. Requires ``gated_linear_unit=True``, no
+    ``bias_activation_fusion``, no ``glu_linear_offset`` and no ``activation_func_clamp_value``."""
+
     xssglu: bool = False
     """If True, replace the gate of a gated linear unit with the learnable XSSGLU gate:
     ``XSSGLU(x_glu, x_linear) = (|alpha|*softsign(x_glu) + 0.5) * x_glu * x_linear``. Unlike
@@ -1790,7 +1797,15 @@ class TransformerConfig(ModelParallelConfig):
             'xssglu': self.xssglu,
             'pn3glu': self.pn3glu,
             'polynorm': self.polynorm,
+            'exp_learnable_gate': self.exp_learnable_gate is not None,
         }
+        if self.exp_learnable_gate is not None and (
+            self.glu_linear_offset != 0.0 or self.activation_func_clamp_value is not None
+        ):
+            raise ValueError(
+                f"exp_learnable_gate={self.exp_learnable_gate} supports neither glu_linear_offset "
+                "nor activation_func_clamp_value."
+            )
         _active_new_activations = [name for name, is_set in _new_activation_flags.items() if is_set]
         if len(_active_new_activations) > 1:
             raise ValueError(
@@ -1801,6 +1816,7 @@ class TransformerConfig(ModelParallelConfig):
             _active_name = _active_new_activations[0]
             _is_gated = _active_name in (
                 'gxpr', 'gxpry', 'gxprv2', 'gxr2', 'xr2glu', 'xssglu', 'pn3glu',
+                'exp_learnable_gate',
             )
             if _is_gated and not self.gated_linear_unit:
                 raise ValueError(

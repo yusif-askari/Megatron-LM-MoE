@@ -506,6 +506,11 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         # other TP ranks.
         self.output_splits_tp = None
         self.permute_idx_device = torch.device("cuda") if self.config.moe_permute_fusion else "cpu"
+        if self.config.moe_permute_fusion:
+            from megatron.core.transformer.moe import triton_fast
+
+            if triton_fast.FAST_ROW_ID_MAP:  # MOE_FAST_ROW_ID_MAP=1: one-kernel row map for TE's fused permute
+                triton_fast.install()
         input_chunk_idxs = torch.arange(
             self.num_experts * self.tp_size, device=self.permute_idx_device
         )
@@ -611,6 +616,9 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             )
             return num_tokens_per_local_expert
 
+        if self._use_host_splits():
+            return self._preprocess_host_splits(routing_map)
+
         # [num_experts], number of tokens assigned to each expert from the current rank's input.
         num_local_tokens_per_expert = routing_map.sum(dim=0).long()
 
@@ -693,6 +701,80 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         ), "cuda_sync_point must be after cuda_dtoh_point."
         return num_tokens_per_local_expert
 
+    def _use_host_splits(self) -> bool:
+        """MOE_HOST_SPLITS=1 and the configuration _preprocess_host_splits covers: expert parallelism without
+        tensor parallelism, dropless routing, fused permute, no CUDA graph over the preprocess step."""
+        ok = getattr(self, "_host_splits_ok", None)
+        if ok is None:
+            from megatron.core.transformer.moe import triton_fast
+
+            ok = self._host_splits_ok = bool(
+                triton_fast.HOST_SPLITS
+                and self.tp_size == 1
+                and self.ep_size > 1
+                and self.num_local_experts > 1
+                and self.config.moe_permute_fusion
+                and self.config.moe_expert_capacity_factor is None
+                and not self.config.moe_router_padding_for_quantization
+                and self.cuda_dtoh_point == "before_permutation_1"
+            )
+            self._host_rank = utils.get_pg_rank(self.tp_ep_group)
+            self._host_streams = {}
+        return ok
+
+    def _preprocess_host_splits(self, routing_map: torch.Tensor):
+        """preprocess() with the split sizes computed on the host.
+
+        preprocess() derives input_splits, output_splits, output_splits_tp and the tokens per local expert from
+        the all-gathered token counts with five small kernels, copies each of them to the host (four copies on a
+        side stream) and waits for the copies before the all-to-all. All four are sums over parts of the same
+        [ep_size, num_experts] table of counts. Here that table goes to the host in one copy, issued on the
+        current stream and followed by an event; _maybe_dtoh_and_synchronize waits for the event at the same
+        point as before and takes the sums with numpy. Same values, same types (numpy arrays, a CPU tensor)."""
+        # [num_experts], tokens of this rank routed to each expert
+        counts = routing_map.sum(dim=0)
+        self.num_out_tokens = routing_map.size(0) * self.config.moe_router_topk
+        # [ep_size, num_experts]: row r = the counts of rank r of the group
+        gathered = torch.empty(
+            self.ep_size * self.num_experts, dtype=counts.dtype, device=counts.device
+        )
+        torch.distributed.all_gather_into_tensor(gathered, counts, group=self.tp_ep_group)
+        gathered = gathered.view(self.ep_size, self.num_experts)
+        lo, hi = self.local_expert_indices[0], self.local_expert_indices[-1] + 1
+        # [ep_size, num_local_experts] on the device (the sort by local expert / the MXFP4 row maps read it)
+        self.num_global_tokens_per_local_expert = gathered[:, lo:hi].contiguous()
+        host = gathered.to("cpu", non_blocking=True)
+        # event on the current stream right after the copy (torch.cuda.current_stream() without its Python
+        # device lookup, which reads an environment variable on every call)
+        key = torch._C._cuda_getCurrentStream(counts.device.index)
+        stream = self._host_streams.get(key)
+        if stream is None:
+            stream = self._host_streams[key] = torch.cuda.Stream(
+                stream_id=key[0], device_index=key[1], device_type=key[2]
+            )
+        event = torch.cuda.Event()
+        event.record(stream)
+        self._host_pending = (host, event)
+        self.input_splits = self.output_splits = self.output_splits_tp = None
+        self._maybe_update_cuda_sync_point("before_ep_alltoall")
+        return None
+
+    def _finish_host_splits(self):
+        """Wait for the copy of _preprocess_host_splits and take the sums; returns the tokens per local expert."""
+        host, event = self._host_pending
+        self._host_pending = None
+        event.synchronize()
+        counts = host.numpy()                                   # [ep_size, num_experts]
+        lo, hi = self.local_expert_indices[0], self.local_expert_indices[-1] + 1
+        local = counts[:, lo:hi]                                # sent to this rank's experts, by source rank
+        # tokens this rank sends to each rank / receives from each rank
+        self.input_splits = (
+            counts[self._host_rank].reshape(self.ep_size, self.num_local_experts).sum(axis=1)
+        )
+        self.output_splits = local.sum(axis=1)
+        self.output_splits_tp = local.sum(keepdims=True).reshape(1)
+        return torch.from_numpy(local.sum(axis=0))
+
     def dispatch_preprocess(
         self, hidden_states: torch.Tensor, routing_map: torch.Tensor, probs: torch.Tensor
     ):
@@ -726,7 +808,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                 self.routing_map = pad_routing_map(self.routing_map, pad_multiple)
         self.tokens_per_expert = self.preprocess(self.routing_map)
 
-        if self.shared_experts is not None:
+        if self.shared_experts is not None and not getattr(self, "shared_experts_latent", False):
             self.shared_experts.pre_forward_comm(hidden_states.view(self.hidden_shape))
 
         # Permutation 1: input to AlltoAll input
@@ -840,7 +922,21 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         self.tokens_per_expert = self._maybe_dtoh_and_synchronize(
             "before_permutation_2", self.tokens_per_expert
         )
-        if self.num_local_experts > 1:
+        # fold_chunk_sort (set by MoELayer for this call when the routed experts take a token-order map,
+        # megatron/core/mxfp4_alto.py SORT_FOLD): the tokens stay in the received order; chunk_sort_args
+        # describes the sort that was skipped. combine_preprocess then skips the inverse sort.
+        self.chunk_sort_args = None
+        if (
+            getattr(self, "fold_chunk_sort", False)
+            and self.num_local_experts > 1
+            and not self.drop_and_pad
+            and self.tp_size == 1
+        ):
+            self.chunk_sort_args = (
+                self.num_global_tokens_per_local_expert.ravel(),
+                self.sort_input_by_local_experts,
+            )
+        elif self.num_local_experts > 1:
             if self.drop_and_pad:
                 global_input_tokens = (
                     global_input_tokens.view(
@@ -886,7 +982,9 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         parallel dimension.
         """
         # Unpermutation 2: Unsort tokens by local expert.
-        if self.num_local_experts > 1:
+        if getattr(self, "chunk_sort_args", None) is not None:
+            pass  # the experts wrote their output in the received order (fold_chunk_sort)
+        elif self.num_local_experts > 1:
             if self.drop_and_pad:
                 hidden_states = (
                     hidden_states.view(
@@ -978,8 +1076,8 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         # Reshape the output tensor
         output = output.view(self.hidden_shape)
 
-        # Add shared experts output
-        if self.shared_experts is not None:
+        # Add shared experts output (with latent projections MoELayer adds it after the back-projection)
+        if self.shared_experts is not None and not getattr(self, "shared_experts_latent", False):
             shared_expert_output = self.shared_experts.get_output()
             output += shared_expert_output
         return output
@@ -1001,6 +1099,11 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         """
         Move all possible GPU tensors to CPU and make a synchronization at the expected point.
         """
+        if getattr(self, "_host_pending", None) is not None:
+            # MOE_HOST_SPLITS=1: the copy was issued in _preprocess_host_splits
+            if point == self.cuda_sync_point:
+                return self._finish_host_splits()
+            return tokens_per_expert
         if not self.drop_and_pad:
             if point == self.cuda_dtoh_point:
                 # Move all possible GPU tensors to CPU at self.cuda_dtoh_point.

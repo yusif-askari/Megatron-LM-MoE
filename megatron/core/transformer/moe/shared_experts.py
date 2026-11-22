@@ -178,6 +178,13 @@ class SharedExpertMLP(MLP):
         assert self.cached_fc1_input is not None
         if overlapped_comm_output is not None:
             set_tensor_grad_fn_sequence_sr(overlapped_comm_output, torch.iinfo(torch.int).max)
+        if getattr(self, "_mxfp4_fused_mlp", None) is not None:
+            # fused MXFP4 MLP (megatron/core/mxfp4_alto.py): fc1, gate and fc2 are one function; it runs here,
+            # on the side stream, and linear_fc2_forward has nothing left to do
+            with torch.cuda.stream(self.stream):
+                self.cached_fc2_output = self._mxfp4_fused_mlp(self.cached_fc1_input)
+                self.cached_fc1_input = None
+            return
         with torch.cuda.stream(self.stream):
             # [s, b, 4 * h/p]
             intermediate_parallel, bias_parallel = apply_module(self.linear_fc1)(
@@ -228,6 +235,9 @@ class SharedExpertMLP(MLP):
         It is only useful when --moe-shared-expert-overlap is set and may be changed.
         """
         assert self.config.moe_shared_expert_overlap
+        if getattr(self, "_mxfp4_fused_mlp", None) is not None:
+            assert self.cached_fc2_output is not None      # computed in linear_fc1_forward_and_act
+            return
         assert self.cached_fc2_input is not None
         if overlapped_comm_output is not None:
             set_tensor_grad_fn_sequence_sr(overlapped_comm_output, torch.iinfo(torch.int).max)

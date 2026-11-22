@@ -450,7 +450,9 @@ class Float16Module(MegatronModule):
             raise Exception('Either config.fp16 or config.bf16 should be True.')
 
         def convert_module(val):
-            if getattr(val, 'is_kda_decay_parameter', False) or not val.is_floating_point():
+            # keep_fp32: small parameters whose forward should use the fp32 value (exp_gates pglu)
+            if (getattr(val, 'is_kda_decay_parameter', False) or getattr(val, 'keep_fp32', False)
+                    or not val.is_floating_point()):
                 return val
             return val.to(dtype=dtype)
 

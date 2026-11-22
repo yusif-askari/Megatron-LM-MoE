@@ -2003,6 +2003,26 @@ def core_transformer_config_from_args(args, config_class=None):
         kw_args['gated_linear_unit'] = True
         kw_args['activation_func'] = situ_act
         kw_args['bias_activation_fusion'] = False
+    elif getattr(args, 'exp_gate', None) is not None:
+        # Activation-sweep gates (megatron/core/exp_gates.py). A fixed gate (builder gates
+        # exp_l{L}m{M}r{R}_p{power}_b{shift}, exp_arglu, baselines) runs through the generic GLU
+        # path like --lglu / --situ. The learnable exp_pglu is a module with per-expert
+        # coefficients built by MLP / TEGroupedMLP from config.exp_learnable_gate (fused on the
+        # MXFP4 alto backend); activation_func stays a SiLU placeholder for unused code paths.
+        from megatron.core.exp_gates import GATES as EXP_GATES
+
+        assert not args.swiglu, '--exp-gate replaces --swiglu'
+        assert args.exp_gate in EXP_GATES, (
+            f'--exp-gate {args.exp_gate}: unknown or not ported to this fork '
+            f'(learnable: exp_pglu)')
+        fn = EXP_GATES[args.exp_gate]
+        kw_args['gated_linear_unit'] = True
+        if isinstance(fn, type):
+            kw_args['exp_learnable_gate'] = args.exp_gate
+            kw_args['activation_func'] = F.silu
+        else:
+            kw_args['activation_func'] = fn
+        kw_args['bias_activation_fusion'] = False
     if args.pnglu:
         # PolyNorm GLU replaces the gate of a gated linear unit; it is itself a (learnable)
         # gated unit, so it cannot be combined with the non-gated squared-relu.
@@ -2029,6 +2049,7 @@ def core_transformer_config_from_args(args, config_class=None):
         'xr2glu': args.xr2glu,
         'xssglu': args.xssglu,
         'polynorm': args.polynorm,
+        'exp_gate': getattr(args, 'exp_gate', None) is not None,
     }
     _all_activation_flags = dict(_other_new_activation_flags)
     _all_activation_flags.update({
@@ -2430,6 +2451,7 @@ def _add_network_size_args(parser):
         "gxr2",
         "xr2glu",
         "xssglu",
+        "exp_learnable_gate",
         "pn3glu",
         "polynorm",
         "sandwich_norm",
@@ -2533,6 +2555,11 @@ def _add_network_size_args(parser):
                        help='Use SiTU: gate f(x)=sigmoid(x)*tanh(x), output f(x_glu)*x_linear. '
                        'Non-learnable; implies gated linear units. No fused kernel (runs through '
                        'the generic GLU path).')
+    group.add_argument('--exp-gate', type=str, default=None,
+                       help='Activation-sweep gate by name from megatron/core/exp_gates.py, e.g. '
+                       'exp_l0m1r0_p0.5_b1 (rsqrt bump), exp_arglu, or the learnable exp_pglu '
+                       '(per-expert p and b; fused kernels on the MXFP4 alto backend). Implies '
+                       'gated linear units.')
     group.add_argument('--pnglu', action='store_true',
                        help='Replace the SiLU gate of SwiGLU with a learnable 2nd-order '
                        'PolyNorm: gate(x) = |a1|*RMSNorm(x) + |a2|*RMSNorm(x**2). '

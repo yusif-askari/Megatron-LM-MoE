@@ -324,6 +324,7 @@ class MoELayer(BaseMoELayer):
             )
             if self.shared_expert_overlap:
                 self.token_dispatcher.set_shared_experts(self.shared_experts)
+                self.token_dispatcher.shared_experts_latent = bool(self.config.moe_latent_size)
 
         # Inference-optimized mode setup
         if config.transformer_impl == "inference_optimized":
@@ -436,9 +437,11 @@ class MoELayer(BaseMoELayer):
         """
         # Project the hidden_states from hidden dimension down to latent dimenion.
         if self.config.moe_latent_size:
-            assert (
-                not self.shared_expert_overlap
-            ), "Shared expert overlap not supported when MoE latent projections are used."
+            if self.shared_expert_overlap:
+                # The shared expert takes the hidden-size states, the dispatcher the latent ones: the shared
+                # expert is started here (the dispatcher skips its own pre_forward_comm and does not add the
+                # shared output, see shared_experts_latent), and its output is added in postprocess.
+                self.shared_experts.pre_forward_comm(hidden_states)
             hidden_states, _ = self.fc1_latent_proj(hidden_states)
         hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
             hidden_states, routing_map, probs
@@ -494,10 +497,19 @@ class MoELayer(BaseMoELayer):
         for each expert. It then passes the tokens through the local experts.
         The output from the experts is preprocessed for the combine step.
         """
+        # MXFP4 fused routed MLP: it reads the tokens in the received order through its row map, so the
+        # dispatcher's sort by local expert (and the inverse sort of the output) is skipped
+        fold = getattr(self.experts, "takes_token_perm", None)
+        self.token_dispatcher.fold_chunk_sort = bool(fold is not None and fold())
         dispatched_input, tokens_per_expert, permuted_probs = (
             self.token_dispatcher.dispatch_postprocess(hidden_states, probs)
         )
-        if (
+        sort_args = getattr(self.token_dispatcher, "chunk_sort_args", None)
+        if sort_args is not None:
+            expert_output, mlp_bias = apply_module(self.experts)(
+                dispatched_input, tokens_per_expert, permuted_probs, chunk_sort_args=sort_args
+            )
+        elif (
             hasattr(self, "_inference_token_dispatcher")
             and self.is_inference_cuda_graphed_iteration
         ):
@@ -566,6 +578,8 @@ class MoELayer(BaseMoELayer):
         output = self.token_dispatcher.combine_postprocess(output)
         if self.config.moe_latent_size:
             output, _ = self.fc2_latent_proj(output)
+            if self.use_shared_expert and self.shared_expert_overlap:
+                output = output + self.shared_experts.get_output()
 
         if shared_expert_output is not None:
             output = output + shared_expert_output
