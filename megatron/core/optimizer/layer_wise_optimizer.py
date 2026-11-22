@@ -197,9 +197,26 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
 
         # helper function to flatten local params, all-gather,
         # unflatten and copy to model params
+        def _split_by_dtype(fn, params_list, group):
+            """Call fn once per parameter dtype (bf16 weights; fp32 for keep_fp32 parameters such as the exp-gate
+            coefficients). all_gather / broadcast need one dtype, and _flatten_dense_tensors would promote a mixed
+            list to fp32. Every rank holds the same params_list, so the split is identical on all ranks.
+            Returns True if it split (fn already called)."""
+            dtypes = sorted({p.dtype for params in params_list for p in params}, key=str)
+            if len(dtypes) <= 1:
+                return False
+            for dt in dtypes:
+                fn([[p for p in params if p.dtype == dt] for params in params_list], group)
+            return True
+
         def _allgather_helper(params_list, group):
-            device = params_list[0][0].device
-            dtype = params_list[0][0].dtype
+            if _split_by_dtype(_allgather_helper, params_list, group):
+                return
+            first_param = next((p for params in params_list for p in params), None)
+            if first_param is None:
+                return
+            device = first_param.device
+            dtype = first_param.dtype
             rank = get_pg_rank(group)
             dp_size = get_pg_size(group)
             # Flatten this rank's params.
@@ -233,6 +250,8 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                     model_p.data.copy_(updated_p)
 
         def _allgather_helper_experts_param(params_list, group):
+            if _split_by_dtype(_allgather_helper_experts_param, params_list, group):
+                return
             rank = get_pg_rank(group)
             world_size = get_pg_size(group)
 
