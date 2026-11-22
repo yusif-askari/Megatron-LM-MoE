@@ -79,6 +79,42 @@ except ImportError:
         te = MagicMock()
         HAVE_TE = False
 
+
+def _install_te_attention_backend_cache():
+    """Cache TE's attention backend selection per AttentionParams.
+
+    TE keeps only the last AttentionParams (_attention_backends in dot_product_attention.py) and reruns
+    get_attention_backend() whenever they change. A model that alternates layer kinds (sliding-window and full
+    attention) changes them on every layer, so the selection - including a logger.setLevel() that clears the
+    logging cache - runs on every attention forward, on the host while the GPU waits. The selection is a pure
+    function of AttentionParams (a dataclass compared field by field) and the fixed runtime environment, so its
+    result is reused for equal params. Off with MEGATRON_TE_ATTN_BACKEND_CACHE=0."""
+    try:
+        from transformer_engine.pytorch.attention.dot_product_attention import utils as dpa_utils
+    except ImportError:
+        return
+    if getattr(dpa_utils.get_attention_backend, "_megatron_cached", False):
+        return
+    original = dpa_utils.get_attention_backend
+    seen = []  # [(AttentionParams, result)]; a handful of distinct layer kinds
+
+    def get_attention_backend(attention_params=None):
+        if attention_params is None or not dataclasses.is_dataclass(attention_params):
+            return original(attention_params)
+        for params, result in seen:
+            if params == attention_params:
+                return result
+        result = original(attention_params)
+        seen.append((dataclasses.replace(attention_params), result))
+        return result
+
+    get_attention_backend._megatron_cached = True
+    dpa_utils.get_attention_backend = get_attention_backend
+
+
+if HAVE_TE and os.environ.get("MEGATRON_TE_ATTN_BACKEND_CACHE", "1") == "1":
+    _install_te_attention_backend_cache()
+
 _TE_CONFIG_TYPE_KEY = "transformer_engine_config_type"
 
 

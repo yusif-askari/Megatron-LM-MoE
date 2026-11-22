@@ -3390,7 +3390,9 @@ def train(
             record_shapes=args.pytorch_profiler_collect_shapes,
             with_stack=args.pytorch_profiler_collect_callstack,
             execution_trace_observer=et,
-            activities=[torch.profiler.ProfilerActivity.CUDA, torch.profiler.ProfilerActivity.CPU]
+            activities=([torch.profiler.ProfilerActivity.CUDA]
+                        if os.environ.get("MEGATRON_PROF_CUDA_ONLY") == "1" else
+                        [torch.profiler.ProfilerActivity.CUDA, torch.profiler.ProfilerActivity.CPU])
         )
         prof.start()
 
@@ -3451,8 +3453,13 @@ def train(
             and (len(args.profile_ranks) == 0 or
                  torch.distributed.get_rank() in args.profile_ranks)):
             if args.use_pytorch_profiler:
+                # MEGATRON_PROF_SYNC=1: drain the device before the profiler changes state (ROCm hang test)
+                if os.environ.get("MEGATRON_PROF_SYNC") == "1":
+                    torch.cuda.synchronize()
                 prof.step()
-            if iteration == args.profile_step_start:
+            # MEGATRON_PROF_NO_NVTX=1: no cudaProfilerStart / NVTX ranges (nsys only) under the torch profiler
+            if iteration == args.profile_step_start and not (
+                    args.use_pytorch_profiler and os.environ.get("MEGATRON_PROF_NO_NVTX") == "1"):
                 torch.cuda.check_error(torch.cuda.cudart().cudaProfilerStart())
                 nsys_nvtx_context = torch.autograd.profiler.emit_nvtx(record_shapes=True)
                 nsys_nvtx_context.__enter__()
