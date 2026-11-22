@@ -20,6 +20,7 @@ machinery, so a single class covers both the gains and no-gains cases.
 
 import logging
 import math
+import os
 from typing import Any, Callable, Dict, List, Literal, Optional, Sequence
 
 import torch
@@ -1618,15 +1619,187 @@ class MDDecoupling(_MDDecouplingBase):
             group["step"] += 1
             if "momentum_beta" not in group:
                 group["momentum_beta"] = group["beta1"]
-            for p in group["params"]:
-                if p.grad is not None:
+            params = [p for p in group["params"] if p.grad is not None]
+            batches = []
+            if self.batched_step:
+                for p in params:
                     self._maybe_init_gain_state(p)
-                    gain_grads = self._preprocess_gains(p)
-                    self._param_step(p, group)
-                    self._gains_step(p, group, gain_grads)
-                    self._apply_gains(p)
+                batches, params = self._batch_plan(group, params)
+            for p in params:
+                self._maybe_init_gain_state(p)
+                gain_grads = self._preprocess_gains(p)
+                self._param_step(p, group)
+                self._gains_step(p, group, gain_grads)
+                self._apply_gains(p)
+            for ps in batches:
+                self._batched_step(ps, group)
 
         return loss
+
+    # ------------------------------------------------------------------------------------------
+    # Batched step (MD_BATCHED_STEP=1). Same-shaped matrices with the same treatment (the routed
+    # experts of all MoE layers, above all: 64 per layer per GPU) are stacked and stepped together,
+    # so each operation of the per-matrix step (gain preprocessing, momentum, Newton-Schulz, row
+    # normalization, gain Adam, gain application) is one kernel for the whole stack instead of one
+    # per matrix. Same arithmetic as _preprocess_gains -> _param_step -> _gains_step ->
+    # _apply_gains; Newton-Schulz uses batched GEMMs (baddbmm) instead of addmm, so results can
+    # differ from the per-matrix path by GEMM rounding. Only the configuration below is batched
+    # (rowcol gains, Muon, row hypersphere, TP size 1, no splits other than the GLU fc1 split);
+    # every other matrix takes the per-matrix path.
+    # ------------------------------------------------------------------------------------------
+    batched_step = os.environ.get("MD_BATCHED_STEP", "0") == "1"
+    batch_max = int(os.environ.get("MD_BATCHED_STEP_MAX", "256"))
+
+    def _batch_key(self, p, group):
+        """Signature under which p can share a batched step, or None (per-matrix path)."""
+        if p.ndim != 2 or getattr(p, "merged_offload_expert", False):
+            return None
+        if (not group["use_orthogonal_updates"] or self.normalize_update_to_weight_norm
+                or self.hypersphere_tangential_grad
+                or self.coefficient_type not in _NS_COEFFICIENT_SETS):
+            return None
+        if getattr(p, "is_embedding_or_output_parameter", False) or getattr(p, "is_router", False):
+            return None
+        if self._resolve_mode(False, False) != "row" or self._resolve_gains_mode(p) != "rowcol":
+            return None
+        if (self.is_qkv_fn(p) or self.is_kda_in_proj_fn(p) or self.is_qkv_down_proj_fn(p)
+                or self.is_kv_up_proj_fn(p) or self.is_q_up_proj_fn(p)):
+            return None
+        glu = getattr(p, "glu_split_dim", None) if self.split_fc1 else None
+        if glu not in (None, 0):
+            return None
+        if self._is_revived_matrix(p) or getattr(p, "md_rowcol_gain_pull_coeff", 0.0):
+            return None
+        is_expert_tp = getattr(p, "expert_tp", False)
+        pdim = _tp_partition_dim(p)
+        if pdim in (0, 1) and self.pg_collection is not None:
+            tp_group = self.pg_collection.expt_tp if is_expert_tp else self.pg_collection.tp
+            if get_pg_size(tp_group) != 1:
+                return None
+        state = self.state[p]
+        if "flat_gain" in state or "row_gain" not in state or "col_gain" not in state:
+            return None
+        return (tuple(p.shape), p.dtype, p.grad.dtype, glu, pdim, is_expert_tp,
+                bool(getattr(p, "is_out_proj", False)))
+
+    def _batch_plan(self, group, params):
+        """(batches, rest): stacks of at most batch_max same-key params, and the per-matrix rest
+        (in the original order)."""
+        buckets, rest = {}, []
+        for p in params:
+            key = self._batch_key(p, group)
+            if key is None:
+                rest.append(p)
+            else:
+                buckets.setdefault(key, []).append(p)
+        batches = []
+        for ps in buckets.values():
+            if len(ps) == 1:
+                rest.append(ps[0])
+                continue
+            batches += [ps[i:i + self.batch_max] for i in range(0, len(ps), self.batch_max)]
+        return batches, rest
+
+    def _gain_scalar_bufs(self, group, dev):
+        """lr / bias corrections of the gain Adam as persistent 0-dim device tensors
+        (as _gains_step)."""
+        beta1, beta2 = self.gains_betas
+        step = group["step"]
+        if getattr(self, "_gain_lr_buf", None) is None or self._gain_lr_buf.device != dev:
+            self._gain_lr_buf = torch.zeros((), dtype=torch.float32, device=dev)
+            self._gain_bc1_buf = torch.zeros((), dtype=torch.float32, device=dev)
+            self._gain_bc2_buf = torch.zeros((), dtype=torch.float32, device=dev)
+        self._gain_lr_buf.fill_(self._gains_lr(group))
+        self._gain_bc1_buf.fill_(1.0 - beta1 ** step)
+        self._gain_bc2_buf.fill_(1.0 - beta2 ** step)
+        return self._gain_lr_buf, self._gain_bc1_buf, self._gain_bc2_buf
+
+    def _batched_orth_scale(self, rows: int, cols: int) -> float:
+        """Muon update scale of one (rows, cols) block, as _orthogonalize_tensor (TP size 1)."""
+        use_radius_scale = self._use_radius_scale("row", False)
+        if use_radius_scale and self.hypersphere_radius_mode == "fan_in":
+            return self._fan_in_update_scale(rows, cols)
+        scale = _get_muon_scale_factor(rows, cols, mode=self._resolve_scale_mode(False))
+        if use_radius_scale:
+            scale *= self._init_radius_scale(rows, cols)
+        return scale
+
+    @torch.no_grad()
+    def _batched_step(self, ps, group):
+        p0 = ps[0]
+        eps = 1e-8
+        clamp = not self.gains_no_clamp_min
+        is_out_proj = bool(getattr(p0, "is_out_proj", False))
+        glu = getattr(p0, "glu_split_dim", None) if self.split_fc1 else None
+        states = [self.state[p] for p in ps]
+        for p, st in zip(ps, states):
+            if "exp_avg" not in st:
+                st["exp_avg"] = torch.zeros_like(p.grad)
+        names = ("row_gain", "row_gain_m", "row_gain_v", "col_gain", "col_gain_m", "col_gain_v")
+        P = torch.stack(ps)                                            # [B, out, in]
+        G = torch.stack([p.grad for p in ps])
+        M = torch.stack([st["exp_avg"] for st in states])
+        S = {n: torch.stack([st[n] for st in states]) for n in names}  # [B, out] / [B, in]
+
+        # _preprocess_gains: undo the gains, gain gradients, rescale the gradient.
+        row_eff = self._phi(S["row_gain"])[:, :, None]
+        col_eff = self._phi(S["col_gain"])[:, None, :]
+        P.div_(row_eff.clamp_min(eps) if clamp else row_eff)
+        P.div_(col_eff.clamp_min(eps) if clamp else col_eff)
+        ppg = P * G
+        gain_grads = {"row_gain": torch.sum(ppg * col_eff, dim=2),
+                      "col_gain": torch.sum(ppg * row_eff, dim=1)}
+        del ppg
+        if self.gain_parametrization != "direct":
+            for n in gain_grads:
+                gain_grads[n] = gain_grads[n] * self._phi_prime(S[n])
+        G.mul_(row_eff)
+        G.mul_(col_eff)
+
+        # _param_step, Muon branch (normalized matrices: no weight decay).
+        mb = group["momentum_beta"]
+        M.lerp_(G, 1 - mb)
+        U = G.lerp(M, mb) if self.use_nesterov else M
+        B = U.size(0)
+        blocks = torch.cat(U.chunk(2, dim=1), dim=0) if glu is not None else U
+        with emerging_optimizers.utils.fp32_matmul_precision(self.fp32_matmul_prec):
+            orth = _newton_schulz_batched(blocks, self.num_ns_steps, self.coefficient_type)
+        orth = orth * self._batched_orth_scale(*blocks.shape[-2:]) * self.extra_scale_factor
+        if glu is not None:
+            orth = torch.cat(orth.split(B, dim=0), dim=1)
+        radius_scale = self._resolve_radius_scale(is_out_proj)
+        if radius_scale != 1.0:
+            orth = orth * radius_scale
+        P.add_(orth, alpha=-group["lr"])
+        del orth, blocks, U
+
+        # Post-step row normalization (_normalize_single, mode row; the GLU halves split rows only).
+        norm = torch.norm(P, dim=2, keepdim=True)
+        if _tp_partition_dim(p0) == 1:          # the all-reduced path (TP size 1): sqrt(norm ** 2)
+            norm = torch.sqrt(norm ** 2)
+        P.div_(norm.clamp_min(self.hypersphere_eps))
+        rows = P.size(1) // 2 if glu is not None else P.size(1)
+        radius = self._target_slice_radius(1, rows, P.size(2))
+        if radius != 1.0:
+            P.mul_(radius)
+        if radius_scale != 1.0:
+            P.mul_(radius_scale)
+
+        # _gains_step (no pull: excluded in _batch_key) and _apply_gains.
+        lr_buf, bc1_buf, bc2_buf = self._gain_scalar_bufs(group, p0.device)
+        beta1, beta2 = self.gains_betas
+        for n in ("row_gain", "col_gain"):
+            _fused_gain_adam(S[n], S[n + "_m"], S[n + "_v"], gain_grads[n], lr_buf, bc1_buf, bc2_buf,
+                             beta1, beta2, self.gains_eps, self.gains_weight_decay, 0.0, False)
+        P.mul_(self._phi(S["row_gain"])[:, :, None])
+        P.mul_(self._phi(S["col_gain"])[:, None, :])
+
+        # Write back.
+        torch._foreach_copy_(ps, list(P.unbind(0)))
+        torch._foreach_copy_([p.grad for p in ps], list(G.unbind(0)))
+        torch._foreach_copy_([st["exp_avg"] for st in states], list(M.unbind(0)))
+        for n in names:
+            torch._foreach_copy_([st[n] for st in states], list(S[n].unbind(0)))
 
     @torch.no_grad()
     def revive_collapsed_col_gains(self, threshold: float, mean_mode: str = "all") -> Optional[torch.Tensor]:
@@ -1871,6 +2044,38 @@ class MDDecoupling(_MDDecouplingBase):
         if is_output and self.hypersphere_gains_mode_output is not None:
             return self.hypersphere_gains_mode_output
         return self.hypersphere_gains_mode
+
+
+try:
+    from emerging_optimizers.orthogonalized_optimizers.muon_utils import (
+        _COEFFICIENT_SETS as _NS_COEFFICIENT_SETS,
+        get_coefficient_iterator as _ns_coefficient_iterator,
+    )
+except ImportError:
+    _NS_COEFFICIENT_SETS = {}
+
+
+def _newton_schulz_batched(x: torch.Tensor, steps: int, coefficient_type: str,
+                           eps: float = 1e-7) -> torch.Tensor:
+    """emerging_optimizers' newton_schulz (non-TP path) over a stack of matrices [B, m, n]:
+    per-matrix Frobenius normalization, bf16 iterations under fp32 matmul precision "medium",
+    A = X Xᵀ, B = b A + c A A, X = a X + B X with baddbmm in place of addmm."""
+    transpose = x.size(-2) > x.size(-1)
+    if transpose:
+        x = x.mT
+    X = torch.nn.functional.normalize(x, p=2, dim=(-2, -1), eps=eps)
+    mode = "cycle" if coefficient_type != "polar_express" else "repeat_last"
+    coeffs = _ns_coefficient_iterator(steps, _NS_COEFFICIENT_SETS[coefficient_type], mode=mode)
+    if torch.get_float32_matmul_precision() == "medium":
+        X = X.to(torch.bfloat16)
+    for a, b, c in coeffs:
+        A = X @ X.mT
+        Bm = torch.baddbmm(A, A, A, beta=b, alpha=c)
+        X = torch.baddbmm(X, Bm, X, beta=a, alpha=1.0)
+    X = X.to(torch.float32)
+    if transpose:
+        X = X.mT
+    return X
 
 
 @torch.compile(dynamic=True)
