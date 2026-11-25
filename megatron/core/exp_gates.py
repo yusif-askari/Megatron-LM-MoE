@@ -788,6 +788,145 @@ class ExpBGLUCS(ExpBGLU):
 BGLUCS_GATES = {f"exp_bglu_p{_f(p)}_cs": type(f"ExpBGLUCS_p{_f(p)}", (ExpBGLUCS,), {"p": p})
                 for p in (0.5, 1.0, 1.5, 2.0)}
 
+# ---- exp_pglu_lr: PGLU with separate tail exponents left and right of the peak --------------------------------
+# g'(x) = (1 + (b - x))^-pL for x < b,  (1 + (x - b))^-pR for x >= b   (= 1 at x = b from both sides: continuous)
+# g(x)  = H(x - b) - H(-b),  H(u) = F_pL(u) (u < 0), F_pR(u) (u >= 0);  pL = pR is exactly exp_pglu.
+# (optional-project/docs/PGLU_SIGN_SPLIT.md, section 3.) Same numerics as the pglu kernels: when x and 0 lie on the
+# same side of b both terms use one exponent, the "-b side" exponent ps = pL if b > 0 else pR, and the
+# cancellation-free form applies unchanged (coefficient table of ps); otherwise the element's own exponent
+# pe = pL if x < b else pR enters F_pe(x - b), and ps only enters the constant C = F_ps(-b).
+# Per-row sums for the parameters: [dp of rows' pe on x < b, on x >= b, dp through C (-> ps), db].
+PGLU_LR_NCOEF = PGLU_NCOEF + 2   # the pglu table of ps, then pL, pR
+
+
+def _pglu_lr_coefficients(raw_pl, raw_pr, b):
+    pl, pr = F.softplus(raw_pl.float()), F.softplus(raw_pr.float())
+    ps = torch.where(b.float() > 0, pl, pr)
+    return torch.cat([_coefficients(ps, b), pl.unsqueeze(-1), pr.unsqueeze(-1)], dim=-1)
+
+
+def pglu_lr_coefficients(raw_pl, raw_pr, b):
+    """Per-expert table [E, PGLU_LR_NCOEF] fp32 (one fused kernel)."""
+    return _fused(_pglu_lr_coefficients)(raw_pl, raw_pr, b)
+
+
+def _pglu_lr_eval(x, cr):
+    b, c, s, bb, bq = (cr[..., i:i + 1] for i in range(1, 6))
+    pl, pr = cr[..., PGLU_NCOEF:PGLU_NCOEF + 1], cr[..., PGLU_NCOEF + 1:PGLU_NCOEF + 2]
+    u = x - b
+    left = u < 0
+    pe = torch.where(left, pl, pr)                      # == ps wherever `same` holds
+    su = torch.sign(u)
+    same = (s != 0) & (su == s)
+    w = torch.where(same, s * x / bb, u.abs())
+    l = torch.log1p(w)
+    z = (1.0 - pe) * l
+    ex, em1 = _exprel(z)
+    gate = torch.where(same, s * bq * l * ex, su * l * ex - c)
+    return gate, same, su, w, l, z, em1, ex, pe, left
+
+
+def _pglu_lr_fwd(g, v, cr, prob):
+    gf = g.float()
+    gate = _pglu_lr_eval(gf, cr)[0]
+    return (gate * v.float() * prob).to(g.dtype)
+
+
+def _pglu_lr_bwd(dh, g, v, cr, prob):
+    vf, dhf, gf = v.float(), dh.float(), g.float()
+    gate, same, su, w, l, z, em1, ex, pe, left = _pglu_lr_eval(gf, cr)
+    s, bq, k, lb, dc_dp = (cr[..., i:i + 1] for i in (3, 5, 6, 7, 8))
+    d_out = dhf * prob
+    d_v = (d_out * gate).to(g.dtype)
+    dgate = d_out * vf
+    zp = -pe * l
+    # (1 + w)^-pe as exp(-pe l): (em1 + 1) / (1 + w) (the pglu kernel's form) cancels in fp32 when e^z << 1
+    # (pe > 1, far from b: relative error ~ eps / e^z, e.g. 6e-3 at pe = 4, |x - b| = 47)
+    gp1 = torch.exp(zp)
+    gp = torch.where(same, k * gp1, gp1)                # g'(x) = (1 + |x - b|)^-pe
+    d_g = (dgate * gp).to(g.dtype)
+    phi = _phi(z, em1)
+    # derivative w.r.t. the element's exponent pe (same side: pe = ps, the whole dependence incl. C)
+    dg_dpe = torch.where(same, -s * bq * l * (lb * ex + l * phi), -su * l * l * phi)
+    dg_dps = torch.where(same, torch.zeros_like(l), -dc_dp.expand_as(l))   # through C = F_ps(-b) only
+    dg_db = torch.where(same, torch.where(zp.abs() < 0.5, -k * zp * _exprel_series(zp), k * (1.0 - gp1)), k - gp1)
+    dprob = (gate * vf * dhf).sum(-1, keepdim=True)
+    t = dgate * dg_dpe
+    sums = torch.stack([torch.where(left, t, torch.zeros_like(t)).sum(-1),
+                        torch.where(left, torch.zeros_like(t), t).sum(-1),
+                        (dgate * dg_dps).sum(-1), (dgate * dg_db).sum(-1)], -1)
+    return d_g, d_v, dprob, sums
+
+
+def _pglu_lr_param_grads(tot, raw_pl, raw_pr, b):
+    """Per-expert sums [E, 4] fp64 -> dL/d raw_pL, dL/d raw_pR, dL/db in the parameters' dtypes."""
+    bl = (b.double() > 0)
+    dpl = tot[:, 0] + torch.where(bl, tot[:, 2], torch.zeros_like(tot[:, 2]))
+    dpr = tot[:, 1] + torch.where(bl, torch.zeros_like(tot[:, 2]), tot[:, 2])
+    return ((dpl * torch.sigmoid(raw_pl.double())).float().to(raw_pl.dtype),
+            (dpr * torch.sigmoid(raw_pr.double())).float().to(raw_pr.dtype), tot[:, 3].float().to(b.dtype))
+
+
+class _WeightedPGLULR(torch.autograd.Function):
+    """h = bf16(g(y_gate) * y_value * prob) for exp_pglu_lr over expert-sorted rows (segments of `counts`)."""
+
+    @staticmethod
+    def forward(ctx, y, prob, raw_pl, raw_pr, b, counts):
+        g, v = torch.chunk(y, 2, dim=-1)
+        pr = prob.float() if prob is not None else _one(y.device)
+        cr = _rows(pglu_lr_coefficients(raw_pl, raw_pr, b), counts, y.shape[0])
+        h = _fused(_pglu_lr_fwd)(g, v, cr, pr)
+        ctx.save_for_backward(y, prob, raw_pl, raw_pr, b)
+        ctx.counts = counts
+        return h
+
+    @staticmethod
+    def backward(ctx, dh):
+        y, prob, raw_pl, raw_pr, b = ctx.saved_tensors
+        pr = prob.float() if prob is not None else _one(y.device)
+        cr = _rows(pglu_lr_coefficients(raw_pl, raw_pr, b), ctx.counts, y.shape[0])
+        g, v = torch.chunk(y, 2, dim=-1)
+        d_g, d_v, dprob, sums = _fused(_pglu_lr_bwd)(dh, g, v, cr, pr)
+        d_pl, d_pr, d_b = _pglu_lr_param_grads(segment_sum(sums, ctx.counts), raw_pl, raw_pr, b)
+        dprob = dprob.to(prob.dtype).reshape(prob.shape) if prob is not None and ctx.needs_input_grad[1] else None
+        return torch.cat([d_g, d_v], dim=-1), dprob, d_pl, d_pr, d_b, None
+
+
+class ExpPGLULR(_PGLUFamilyGate):
+    """PGLU with separate learnable tail exponents left and right of the peak, pL = softplus(rho_L) for x < b and
+    pR = softplus(rho_R) for x >= b, and a learnable shift b (per expert); the slope is continuous (1 at x = b).
+    Init pL = pR = 1, b = 1 == exp_pglu at init. fp32 parameters (keep_fp32), fused kernels as exp_pglu."""
+
+    def __init__(self, config=None, p_init=1.0, b_init=1.0, num_local_experts=1):
+        super().__init__(config, num_local_experts)
+        rho = torch.log(torch.expm1(torch.tensor(float(p_init)))).item()
+        self.raw_pl = self._param(rho, keep_fp32=True)
+        self.raw_pr = self._param(rho, keep_fp32=True)
+        self.b = self._param(b_init, keep_fp32=True)
+
+    def coefficients(self):
+        return {"pL": F.softplus(self.raw_pl.float()), "pR": F.softplus(self.raw_pr.float()), "b": self.b.float()}
+
+    def weighted_glu(self, y, probs=None, tokens_per_expert=None):
+        counts = self._counts(y.shape[0], tokens_per_expert)
+        h = _WeightedPGLULR.apply(y, probs, self.raw_pl, self.raw_pr, self.b, counts)
+        if _DUMP_DIR and self.num_local_experts > 1:
+            _DUMP_ORDER.setdefault(id(self), len(_DUMP_ORDER))
+        return h
+
+    def forward(self, x, tokens_per_expert=None, expert_ids=None):
+        """The gate alone, g(x) in x.dtype, fp32 inside (analysis: --log-glu-stats; no parameter gradients)."""
+        coef = pglu_lr_coefficients(self.raw_pl, self.raw_pr, self.b)
+        if expert_ids is not None:
+            cr = coef.index_select(0, expert_ids.long())
+        elif self.num_local_experts == 1:
+            cr = coef
+        else:
+            cr = _rows(coef, self._counts(x.shape[0], tokens_per_expert), x.shape[0])
+        xs = x.unsqueeze(-1) if x.dim() == 1 else x
+        return _pglu_lr_eval(xs.float(), cr)[0].to(x.dtype).reshape(x.shape)
+
+
 class ExpXRLGLU(_PerExpertGate):
     """Learnable negative-dip depth alpha (expanded-range trick on RLGLU), per expert: g'
     stretched from (0,1) to (-alpha,1). g(0) = 0; alpha = 0 is exp_l0m0.5r1_p1_b0 (RLGLU)."""
@@ -812,7 +951,7 @@ def exp_ssglu(x):  return x * (0.5 + 0.5 * F.softsign(x))
 # ---- master registry: name -> callable (or class) ----------------------------
 GATES = {name: fn for name, (fn, _) in BUILDER_GATES.items()}
 LEARNABLE_GATES = {"exp_pglu": ExpPGLU, "exp_xrlglu": ExpXRLGLU, **BGLU_GATES,
-                   "exp_pglu_c": ExpPGLUC, **BGLUC_GATES, **BGLUCS_GATES}
+                   "exp_pglu_c": ExpPGLUC, **BGLUC_GATES, **BGLUCS_GATES, "exp_pglu_lr": ExpPGLULR}
 GATES.update(exp_arglu=exp_arglu, **LEARNABLE_GATES,
              exp_swiglu=exp_swiglu, exp_situ=exp_situ, exp_ssglu=exp_ssglu)
 
