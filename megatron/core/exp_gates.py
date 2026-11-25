@@ -19,6 +19,7 @@ Self-test (g(0)=0 and autograd == analytic g' for every builder gate):
     uv run python new_gates.py
 """
 import itertools
+import os
 import math
 
 import torch
@@ -616,6 +617,42 @@ class _PerExpertGate(MegatronModule):
         counts = torch.as_tensor(tokens_per_expert, device=x.device)
         return torch.repeat_interleave(t, counts, output_size=n).unsqueeze(-1)
 
+# PGLU_DUMP_DIR (analysis only; unset in training): the first call with grad enabled of each routed-expert gate
+# whose MoE-layer index (0 = first MoE layer, in call order) is in PGLU_DUMP_LAYERS (default 0) saves its real
+# inputs and coefficients, the h it produced, and dL/dh and dL/dy from the backward, to
+# <dir>/rank<r>_moe<i>.pt (scripts: optional-project/sweep-results/3b-large-scale/scripts/check_pglu_real.py).
+_DUMP_DIR = os.environ.get("PGLU_DUMP_DIR")
+_DUMP_LAYERS = {int(i) for i in os.environ.get("PGLU_DUMP_LAYERS", "0").split(",") if i.strip()}
+_DUMP_ORDER = {}
+
+
+def _dump_once(gate, y, probs, counts, h):
+    idx = _DUMP_ORDER[id(gate)]
+    if idx not in _DUMP_LAYERS or getattr(gate, "_dumped", False):
+        return
+    gate._dumped = True
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    raw_p, p_fixed, c = gate._gate_args()
+    rec = {"y": y.detach().cpu(), "probs": None if probs is None else probs.detach().cpu(), "counts": list(counts),
+           "raw_p": None if raw_p is None else raw_p.detach().float().cpu(), "b": gate.b.detach().float().cpu(),
+           "p_fixed": p_fixed, "c": None if c is None else c.detach().float().cpu(), "h": h.detach().cpu()}
+    path = os.path.join(_DUMP_DIR, f"rank{rank}_moe{idx}.pt")
+
+    def on_dh(g):
+        rec["dh"] = g.detach().cpu()
+        if not y.requires_grad:
+            torch.save(rec, path)
+
+    def on_dy(g):
+        rec["dy"] = g.detach().cpu()
+        torch.save(rec, path)
+        print(f"[PGLU_DUMP] wrote {path}: rows {y.shape[0]}, F {y.shape[1] // 2}", flush=True)
+
+    h.register_hook(on_dh)
+    if y.requires_grad:
+        y.register_hook(on_dy)
+
+
 class _PGLUFamilyGate(_PerExpertGate):
     """The pglu family on the fused kernels above (fp32 coefficients, h rounded to bf16 once, analytic
     backward). Subclasses set the parameters and _gate_args() -> (raw_p or None, fixed p or None, c or None).
@@ -636,8 +673,13 @@ class _PGLUFamilyGate(_PerExpertGate):
         """h = bf16(gate(y_gate) * y_value * probs) for the fc1 output y [N, 2F] (expert-sorted rows),
         probs [N, 1] or None."""
         raw_p, p_fixed, c = self._gate_args()
-        return _WeightedPGLU.apply(y, probs, raw_p, self.b, self._counts(y.shape[0], tokens_per_expert),
-                                   p_fixed, c)
+        counts = self._counts(y.shape[0], tokens_per_expert)
+        h = _WeightedPGLU.apply(y, probs, raw_p, self.b, counts, p_fixed, c)
+        if _DUMP_DIR and self.num_local_experts > 1:
+            _DUMP_ORDER.setdefault(id(self), len(_DUMP_ORDER))      # forward order, also under recompute
+            if torch.is_grad_enabled():
+                _dump_once(self, y, probs, counts, h)
+        return h
 
     def forward(self, x, tokens_per_expert=None, expert_ids=None):
         """The gate alone, gate(x) in x.dtype (analysis; training uses weighted_glu)."""
