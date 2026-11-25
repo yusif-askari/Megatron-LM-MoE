@@ -420,6 +420,8 @@ class TEGroupedMLP(MegatronModule):
         ``config.polynorm``) is set, to map
         each expert's coefficients onto its tokens.
         """
+        if _GLU_INPUT_STATS:
+            _record_glu_input(self, intermediate_parallel)
         if self.config.use_te_activation_func:
             if bias_parallel is not None:
                 intermediate_parallel = intermediate_parallel + bias_parallel
@@ -2022,3 +2024,44 @@ class OffloadingExpertsMLP(MegatronModule):
                 )
             )
         return sharded_state_dict
+
+
+# GLU_INPUT_STATS_FILE (analysis only; unset in training): per routed-expert MoE layer (0 = first, in call order),
+# the sum of squares, count and absmax of the fc1 output's gate half (z2, gate input) and value half (z1), over every
+# bias_act_func call of the process (one value per call under activation recompute, which does not bias the rms);
+# written at exit to <file>.rank<r>.json.
+import atexit as _atexit
+import json as _json
+import os as _os
+
+_GLU_INPUT_STATS = _os.environ.get("GLU_INPUT_STATS_FILE")
+_GLU_IN = {}
+
+
+def _record_glu_input(module, y):
+    with torch.no_grad():
+        idx = _GLU_IN.setdefault(id(module), {"idx": len(_GLU_IN), "acc": None})
+        g, v = torch.chunk(y, 2, dim=-1)
+        gf, vf = g.float(), v.float()
+        cur = torch.stack([gf.pow(2).sum(), torch.tensor(float(g.numel()), device=y.device), gf.abs().max(),
+                           vf.pow(2).sum(), vf.abs().max()]).double()
+        if idx["acc"] is None:
+            idx["acc"] = cur
+        else:
+            a = idx["acc"]
+            idx["acc"] = torch.stack([a[0] + cur[0], a[1] + cur[1], torch.maximum(a[2], cur[2]),
+                                      a[3] + cur[3], torch.maximum(a[4], cur[4])])
+
+
+def _write_glu_input_stats():
+    if not _GLU_INPUT_STATS or not _GLU_IN:
+        return
+    rank = int(_os.environ.get("RANK", _os.environ.get("SLURM_PROCID", "0")))
+    out = {str(d["idx"]): dict(zip(("z2_sumsq", "n", "z2_absmax", "z1_sumsq", "z1_absmax"), d["acc"].tolist()))
+           for d in _GLU_IN.values() if d["acc"] is not None}
+    with open(f"{_GLU_INPUT_STATS}.rank{rank}.json", "w") as f:
+        _json.dump(out, f)
+
+
+if _GLU_INPUT_STATS:
+    _atexit.register(_write_glu_input_stats)
