@@ -9,6 +9,7 @@ from torch import Tensor
 from megatron.core import tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
+from megatron.core.fusions import fused_linear_cross_entropy
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.common.embeddings import YarnRotaryEmbedding
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
@@ -683,6 +684,31 @@ class GPTModel(LanguageModule):
             output_logit_logging.record_hidden(
                 hidden_states, loss_mask, self.pg_collection.tp,
                 sequence_parallel=self.output_layer.sequence_parallel,
+            )
+
+        # MEGATRON_FUSED_LINEAR_CE=1: output layer + cross entropy in chunks, without the full logits
+        # (fusions/fused_linear_cross_entropy.py). Used only where it computes what the code below
+        # computes: training with the native fused cross entropy, tensor-parallel size 1, no bias,
+        # no logit scaling, and nothing that needs the logits themselves.
+        if (
+            self.training
+            and labels is not None
+            and loss_mask is not None
+            and fused_linear_cross_entropy.enabled()
+            and self.config.cross_entropy_loss_fusion
+            and self.config.cross_entropy_fusion_impl == 'native'
+            and self.pg_collection.tp.size() == 1
+            and not self.output_layer.sequence_parallel
+            and getattr(self.output_layer, "bias", None) is None
+            and not self.config.use_mup
+            and not self.config.mtp_num_layers
+            and not output_logit_logging.is_active()
+            and not topk_logit_saving.is_active()
+            and not has_config_logger_enabled(self.config)
+        ):
+            weight = output_weight if output_weight is not None else self.output_layer.weight
+            return fused_linear_cross_entropy.fused_linear_cross_entropy(
+                hidden_states, weight, labels, loss_mask
             )
 
         logits, _ = self.output_layer(
